@@ -1,6 +1,6 @@
 # Minimal Deepseek R1 inference
 
-**tl;dr: high-performance open-source Deepseek R1 inference using JAX**
+**tl;dr: open-source Deepseek R1 inference using JAX, minimal yet decent performance**
 
 <br/>
 
@@ -18,7 +18,7 @@ via [main.py](main.py). Among other things, the model code demonstrates:
 
 This implementation aims for comparable performance and cost to other R1
 inference offerings, using a fully open-source, easy-to-understand, minimal
-codebase. We hope to offer an accessible starting point for high-performance 
+codebase. We hope to offer an accessible starting point for performant 
 inference with JAX. See the [performance rundown](#inference-performance-results) 
 below.
 
