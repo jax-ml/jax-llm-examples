@@ -1,4 +1,4 @@
-# Fast, cheap, and minimal Deepseek R1 inference
+# Minimal Deepseek R1 inference
 
 **tl;dr: high-performance open-source Deepseek R1 inference using JAX**
 
@@ -18,8 +18,9 @@ via [main.py](main.py). Among other things, the model code demonstrates:
 
 This implementation aims for comparable performance and cost to other R1
 inference offerings, using a fully open-source, easy-to-understand, minimal
-codebase. The only cost is that of compute. See the [performance
-rundown](#inference-performance-results) below.
+codebase. We hope to offer an accessible starting point for high-performance 
+inference with JAX. See the [performance rundown](#inference-performance-results) 
+below.
 
 In addition, this repo includes an
 [overview](#transformer-parallelism-strategies) of how to shard transformers and
@@ -38,7 +39,10 @@ ipyparallel.
 
 ## Quickstart
 
-Run on all hosts in a TPU cluster:
+Due to the large model size (671B parameters), a multi-host platform is required to run
+the full model. We've tested on v5e-64.
+
+Run on all hosts in the TPU cluster:
 ```
 $ python3 main.py
 ```
@@ -100,6 +104,16 @@ in inference.
   since that strategy relies on a all-reduce communication instead of repeated
   reduce-scatters. Computation (weights shards) is still partitioned, but local
   shared memory is traded for lower-latency communication.
+
+- Q: Why doesn't this match the cost and performance of proprietary inference APIs?
+
+  A: This example aims to balance simplicity with performance, and thus does not
+  implement every possible optimization if they would add considerable complexity
+  (e.g. heavy use of custom kernels). In addition, this example only uses
+  well-known optimization strategies, and does not aim to introduce any new or
+  closed-source techniques that inference providers may have independently developed.
+  
+
 
 #### TPU Optimizations
 
@@ -449,3 +463,4 @@ print(f"Hello from {socket.gethostname()}")
 - [ ] GPU suport
 - [ ] ragged decode MLA kernel
 - [ ] further prefill throughput optimizations
+- [ ] distilled models
