@@ -1,6 +1,6 @@
 # Minimal Deepseek R1 inference
 
-**tl;dr: open-source Deepseek R1 inference using JAX, minimal yet decent performance**
+**tl;dr: open-source Deepseek R1 inference using JAX, minimal yet with decent performance**
 
 <br/>
 
