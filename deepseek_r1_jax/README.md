@@ -93,7 +93,7 @@ HBM leading to >100% utilization.
 ### Optimization Decisions
 
 Deepseek is a unique model in that it (i) uses a unique form of attention,
-Multi-Head Attention (MLA) and (ii) uses an MoE layer with a large number of
+Multi-head Latent Attention (MLA) and (ii) uses an MoE layer with a large number of
 small experts. This presents some challenges in optimizing the model for
 TPUs and GPUs to maximize either compute (in training) or memory-bandwidth use
 in inference.
