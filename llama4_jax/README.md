@@ -11,8 +11,8 @@ This is a pure JAX implementation of Llama 4 inference, including a checkpoint
 converter for the weights. It currently runs on TPU. Support for GPU is
 in-progress.
 
-The entire model is defined in [model.py](llama4_jax/model.py) and invoked
-via [main.py](main.py). Among other things, the model code demonstrates:
+The entire model is defined in [__main__.py](llama4_jax/__main__.py) and invoked
+via `python3 -m llam4_jax`. Among other things, the model code demonstrates:
 * an MLA attention implementation;
 * expert and tensor-parallelism via JAX's
   [`shard_map`](https://docs.jax.dev/en/latest/sharded-computation.html#manual-parallelism-with-shard-map)
@@ -47,12 +47,12 @@ the full model. We've tested on v5e-64.
 
 Run on all hosts in the TPU cluster:
 ```
-$ python3 main.py
+$ python3 -m llam4_jax
 ```
 e.g. for Cloud TPU:
 ```
 $ gcloud compute tpus tpu-vm ssh {TPU_NAME} --worker=all \
-    --command="cd ~/llama4_jax && python3 main.py"
+    --command="cd ~/llama4_jax && python3 -m llam4_jax"
 ```
 
 Responses:

@@ -32,10 +32,11 @@ from jax.sharding import PartitionSpec as P, use_mesh
 from jax.experimental.shard import auto_axes, reshard
 from etils import epath
 
-from . import ragged_attention
-from .decode_ragged_dot import decode_ragged_dot
+from llama4_jax import ragged_attention
+from llama4_jax.decode_ragged_dot import decode_ragged_dot
 
-map, builtin_map = jax.util.safe_map, map
+builtin_map = map
+map = jax.util.safe_map
 AxisName = str | tuple[str, ...] | None
 Axes = tuple[AxisName, ...]
 
