@@ -15,7 +15,6 @@
 import dataclasses
 from etils import epath
 import json
-from pprint import pformat
 
 import jax
 from jax import numpy as jnp

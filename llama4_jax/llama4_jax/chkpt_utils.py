@@ -18,7 +18,6 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import dataclasses
-from typing import Any
 
 import jax
 from jax import numpy as jnp
@@ -26,7 +25,7 @@ from jax.sharding import PartitionSpec as P
 import torch
 from tqdm import tqdm
 
-from . import model as l4jax
+from llama4_jax import model as l4jax
 
 
 def quantize_model(ckpt_path: Path, quant_ckpt_path: Path):

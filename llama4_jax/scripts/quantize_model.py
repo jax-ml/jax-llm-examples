@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 
-import sys
+import os.path
 from pathlib import Path
 from argparse import ArgumentParser
 
-try:
-    from llama4_jax import chkpt_utils as utils
-except ImportError:
-    sys.path.append(str(Path(__file__).parent.absolute()))
-
-    from llama4_jax import chkpt_utils as utils
+from llama4_jax import chkpt_utils as utils
 
 
 def main(path: str | Path, suffix: str):
@@ -21,7 +16,8 @@ def main(path: str | Path, suffix: str):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "--path", default="~/DeepSeek-R1-Distill-Llama-70B", required=True, help="Existing JAX model checkpoint path"
+        "--path", default=os.path.join(os.path.expanduser("~"), "DeepSeek-R1-Distill-Llama-70B"),
+        required=True, help="Existing JAX model checkpoint path"
     )
     parser.add_argument(
         "--suffix",

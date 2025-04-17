@@ -1,7 +1,7 @@
 [project]
 name = "llama4_jax"
 version = "0.1.0"
-description = ""
+description = "Pure JAX implementation of Llama 4 inference, including a checkpoint converter for the weights."
 authors = [
     { name = "Robert Dyro" },
 ]
@@ -13,6 +13,7 @@ dependencies = [
     "jax",
     "torch",
     "transformers",  # for the model config and the tokenizer
+    "tune_jax",
     "tqdm",
     "numpy",
     "orbax-checkpoint",
