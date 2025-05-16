@@ -415,44 +415,15 @@ This section shows how you can do that:
 This guide has specific instructions for setting up a TPU Pod with GCS, but a
 similar setup can be applied to any Linux multi-host platform, including GPU.
 
-### Creating a multi-host TPU VM
+#### Setup McJax
+bash mcjax_setup.sh
 
-```bash
-TPU_ZONE="zone, e.g. us-central1-a"
-PROJECT="your-project"
-IMAGE="v2-alpha-tpuv5-lite"
-ACCELERATOR="v5litepod-64"
-TPU_NAME="my_tpu"
-TPU_NAME="$NAME_PREFIX"-"$ACCELERATOR"
-
-gcloud alpha compute tpus tpu-vm create "$TPU_NAME" --zone="$TPU_ZONE" \
-  --project="$PROJECT" --accelerator-type="$ACCELERATOR" --version="$IMAGE"
+#### Clone the model
 ```
+source mcjax_defs.sh
 
-### Utilities and package installation
-
-```bash
-# Util function to start remote processes on TPU machines.
-TPU_NAME="..."
-TPU_ZONE="..."
-TPU_PROJECT="..."
-
-tpu_exec() {
-    local workers=$(seq $1 $2 | tr '\n' ',')
-    gcloud alpha compute tpus tpu-vm ssh --zone="$TPU_ZONE" --project="$TPU_PROJECT" \
-      "$TPU_NAME" --worker="$workers" --command="$3"
-}
-```
-
-```bash
-# Install required packages and virtualenv.
-INSTALL_COMMAND=$(cat << EOM
-  sudo apt update
-  sudo apt install -y nfs-common nfs-kernel-server nfs-server net-tools tmux python3-ipyparallel
-  curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.local/bin/env
-  uv python install 3.10 && uv venv --python 3.10
+MODEL_INSTALL_COMMAND=$(cat << EOM
   cd ~/
-  uv pip install -U "jax[tpu]" ipyparallel 
   if [ ! -d jax-llm-examples/deepseek_r1_jax ]; then
     git clone https://github.com/jax-ml/jax-llm-examples.git
   fi
@@ -460,77 +431,28 @@ INSTALL_COMMAND=$(cat << EOM
   uv pip install -e .
 EOM
 )
-
-tpu_exec 0 15 "$INSTALL_COMMAND"
+tpu_exec 0 15 MODEL_INSTALL_COMMAND
 ```
 
-### Setting up code & data on the TPU-VM.
-
-#### 1. [gcsfuse](https://cloud.google.com/storage/docs/cloud-storage-fuse/install#install-source-code)
-
-For datasets and checkpoints.
-
-```bash
-mkdir {local_folder}
-gcsfuse --implicit-dirs {bucket_name_no_gs://} {local_folder}
-```
-#### 2. NFS
-
-For code consistency between hosts in the TPU Pod / Cluster.
-
-```bash
-# on worker 0
-WORKER0_IP="..." # Internal IP address
-mkdir -p ~/nfs; sudo umount ~/nfs
-echo "$HOME/nfs $WORKER0_IP/24(rw,sync,no_subtree_check)" | sudo tee /etc/exports
-sudo exportfs -a
-sudo systemctl enable nfs-server; sudo systemctl restart nfs-server
-sudo chown $USER:$USER -R ~/nfs
-```
-
-```bash
-MOUNT_COMMAND=$(cat << EOM
-  mkdir -p ~/nfs
-  sudo umount ~/nfs
-  # VM_USER should be username in your TPU VM and should be the same across all VM workers.
-  sudo mount -t nfs WORKER0_IP:/home/VM_USER/nfs ~/nfs
-EOM
-)
-tpu_exec 1 15 "$MOUNT_COMMAND"
-```
-
-#### (Optionally) 3. [sshfs](https://github.com/libfuse/sshfs)
-
+#### Setup [sshfs](https://github.com/libfuse/sshfs) (optionally)
 For a quick preview from a local machine.
-
-```bash
-sshfs ~/local_folder TPU_WORKER_0_IP:~/remote_folder
+```
+sshfs ~/$LOCAL_DATA_FOLDER $WORKER0_IP$:~/$LOCAL_DATA_FOLDER
 ```
 
-### Starting the `ipyparallel` cluster
+#### Start the jupyter server
+```
+jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='' --NotebookApp.password=''
+```
 
-Start $N - 1$ workers (ipyparallel calls them `engines`) because we want worker 0 to execute interactively.
-
-```bash
-SERVER_IP="..."
-CONTROLLER_SETUP=$(cat << EOM
-tmux kill-session -t controller; pkill -9 python
-tmux new -d -s controller '\
-  . ~/.venv/bin/activate && ipcontroller --profile-dir=~/nfs --ip=$SERVER_IP'
-EOM
-)
-
-ENGINE_SETUP=$(cat << EOM
-tmux kill-session -t engine; pkill -9 ipengine
-tmux new -d -s engine '. ~/.venv/bin/activate && ipengine --profile-dir=~/nfs'
-EOM
-)
-
-tpu_exec 0 0  "$CONTROLLER_SETUP"  # only worker 0
-tpu_exec 1 15 "$ENGINE_SETUP" # all workers except worker 0
+#### Setup port forward on local machine
+```
+source mcjax_defs.sh
+gcloud alpha compute tpus tpu-vm ssh --zone $TPU_ZONE --project=$TPU_PROJECT $TPU_NAME -L 8888:localhost:8888
 ```
 
 #### Confirm ipyparallel setup works by ssh'ing into worker 0.
+Open http://127.0.0.1:8888/
 > Cell 0:
 ```python
 import ipyparallel as ip
