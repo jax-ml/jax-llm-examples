@@ -120,7 +120,7 @@ memory-bandwidth use in inference.
   (e.g. heavy use of custom kernels). In addition, this example only uses
   well-known optimization strategies, and does not aim to introduce any new or
   closed-source techniques that inference providers may have independently developed.
-  
+
 
 
 #### TPU Optimizations
@@ -136,7 +136,7 @@ memory-bandwidth use in inference.
 - Q: Which TPU image to use?
 
   A: For v5e: `v2-alpha-tpuv5-lite`, for v6e: `v2-alpha-tpuv6e`. See [runtimes](https://cloud.google.com/tpu/docs/runtimes).
-  
+
 #### Custom Kernels
 
 TODO
@@ -144,12 +144,12 @@ TODO
 ## Transformer parallelism strategies
 
 This section overviews different sharding strategies and their performance considerations for Transformer architectures in general.
-For a very in-depth guide on this topic, check out [How to Scale Your Model](https://jax-ml.github.io/scaling-book/). 
+For a very in-depth guide on this topic, check out [How to Scale Your Model](https://jax-ml.github.io/scaling-book/).
 The next section goes over Llama-specific optimizations.
 
 A typical decoder-only transformer consists of
 
-1. An input embedding 
+1. An input embedding
     - a single weight $V \times D$
 2. Repeated Decoder Layers (Attention + a Feed-forward layer)
     * Attention Layer
@@ -159,11 +159,11 @@ A typical decoder-only transformer consists of
     * Feed-forward Layer - a Multilayer Perceptron (MLP) or a Mixture-of-Experts (MoE)
         - always (i) up-projection -> (ii) nonlinearity -> (iii) down-projection
         - MLP
-            - up-projection: $BSD \times DF \rightarrow BSF$ 
+            - up-projection: $BSD \times DF \rightarrow BSF$
             - down-projection: $BSF \times DF \rightarrow BSD$
         - MoE
             - each token in $BS$ can be routed to a matrix slice $EDF[\text{idx}, :, :]$
-            - up-projection: $BSD \times EDF \rightarrow BSF$ 
+            - up-projection: $BSD \times EDF \rightarrow BSF$
             - down-projection: $BSF \times EDF \rightarrow BSD$
 3. An output projection
     - a single weight $D \times V$
@@ -306,98 +306,46 @@ This section shows how you can do that:
 This guide has specific instructions for setting up a TPU Pod with GCS, but a
 similar setup can be applied to any Linux multi-host platform, including GPU.
 
-### Creating a multi-host TPU VM
-
-```bash
-TPU_ZONE="zone, e.g. us-central1-a"
-PROJECT="your-project"
-IMAGE="v2-alpha-tpuv5-lite"
-ACCELERATOR="v5litepod-64"
-TPU_NAME="my_tpu"
-TPU_NAME="$NAME_PREFIX"-"$ACCELERATOR"
-
-gcloud alpha compute tpus tpu-vm create "$TPU_NAME" --zone="$TPU_ZONE" \
-  --project="$PROJECT" --accelerator-type="$ACCELERATOR" --version="$IMAGE"
+#### Setup McJax
+```
+bash mcjax_setup.sh
 ```
 
-### Setting up code & data
-
-#### 1. [gcsfuse](https://cloud.google.com/storage/docs/cloud-storage-fuse/install#install-source-code)
-
-For datasets and checkpoints.
-
+#### Clone the model
 ```
-gcsfuse --implicit-dirs {bucket_name_no_gs://} {local_folder}
-```
-#### 2. NFS
+source mcjax_defs.sh
 
-For code consistency between hosts in the TPU Pod / Cluster.
-
-```bash
-# on worker 0
-WORKER0_IP="..."
-sudo apt install -y nfs-server nfs-common net-tools tmux
-mkdir -p ~/nfs; sudo umount ~/nfs
-echo "$HOME/nfs $WORKER0_IP/24(rw,sync,no_subtree_check)" | sudo tee /etc/exports
-sudo exportfs -a
-sudo systemctl enable nfs-server; sudo systemctl restart nfs-server
-sudo chown $USER:$USER -R ~/nfs
+MODEL_INSTALL_COMMAND=$(cat << EOM
+  cd ~/
+  if [ ! -d jax-llm-examples/llama4 ]; then
+    git clone https://github.com/jax-ml/jax-llm-examples.git
+  fi
+  cd jax-llm-examples/llama4
+  uv pip install -e .
+EOM
+)
+tpu_exec 0 15 MODEL_INSTALL_COMMAND
 ```
 
-```bash
-# on all other workers (!= 0)
-SERVER_IP="..."
-mkdir -p ~/nfs
-sudo umount ~/nfs; sudo mount -t nfs $SERVER_IP:/home/$USER/nfs ~/nfs
-```
-
-#### (Optionally) 3. [sshfs](https://github.com/libfuse/sshfs)
-
+#### Setup [sshfs](https://github.com/libfuse/sshfs) (optionally)
 For a quick preview from a local machine.
-
-```bash
-sshfs ~/local_folder TPU_WORKER_0_IP:~/remote_folder
+```
+sshfs ~/$LOCAL_DATA_FOLDER $WORKER0_IP$:~/$LOCAL_DATA_FOLDER
 ```
 
-### Utilities
-
-```bash
-TPU_NAME="..."
-TPU_ZONE="..."
-TPU_PROJECT="..."
-
-tpu_exec() {
-    local workers=$(seq $1 $2 | tr '\n' ',')
-    gcloud alpha compute tpus tpu-vm ssh --zone="$TPU_ZONE" --project="$TPU_PROJECT" \
-      "$TPU_NAME" --worker="$workers" --command="$2"
-}
-tpu_exec all 'pip install -U "jax[tpu]"'
+#### Start the jupyter server
+```
+jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='' --NotebookApp.password=''
 ```
 
-### Starting the `ipyparallel` cluster
-
-Start $N - 1$ workers (ipyparallel calls them `engines`) because we want worker 0 to execute interactively.
-
-```bash
-SERVER_IP="..."
-CONTROLLER_SETUP=$(cat << EOM
-tmux kill-session -t controller; pkill -9 python
-tmux new -d -s controller '\
-  . ~/venv/bin/activate && ipcontroller --profile-dir=~/nfs --ip=$SERVER_IP'
-EOM
-)
-
-ENGINE_SETUP=$(cat << EOM
-tmux kill-session -t engine; pkill -9 ipengine
-tmux new -d -s engine '. ~/venv/bin/activate && ipengine --profile-dir=~/nfs'
-EOM
-)
-
-tpu_exec 0 0  "$CONTROLLER_CMD"  # only worker 0
-tpu_exec 1 15 "$ENGINE_CMD" # all workers except worker 0
+#### Setup port forward on local machine
+```
+source mcjax_defs.sh
+gcloud alpha compute tpus tpu-vm ssh --zone $TPU_ZONE --project=$TPU_PROJECT $TPU_NAME -L 8888:localhost:8888
 ```
 
 #### Jupyter Notebook
+Open http://127.0.0.1:8888/
 > Cell 0:
 ```python
 import ipyparallel as ip
