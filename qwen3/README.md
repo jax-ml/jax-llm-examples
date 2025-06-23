@@ -1,18 +1,18 @@
-# Minimal Llama 4 (family) inference
+# Minimal Qwen 3 (family) inference
 
-**tl;dr: open-source Llama 4 inference using JAX, minimal yet performant**
+**tl;dr: open-source Qwen 3 inference using JAX, minimal yet performant**
 
 *Note: work in progress, Scout supported with defaults, Maverick's defaults
 tuning in progress.*
 
 <br/>
 
-This is a pure JAX implementation of Llama 4 inference, including a checkpoint
+This is a pure JAX implementation of Qwen 3 inference, including a checkpoint
 converter for the weights. It currently runs on TPU. Support for GPU is
 in-progress.
 
-The entire model is defined in [__main__.py](llama4_jax/__main__.py) and invoked
-via `python3 -m llam4_jax`. Among other things, the model code demonstrates:
+The entire model is defined in [model.py](qwen3_jax/model.py) and invoked
+via [main.py](main.py). Among other things, the model code demonstrates:
 * an MLA attention implementation;
 * expert and tensor-parallelism via JAX's
   [`shard_map`](https://docs.jax.dev/en/latest/sharded-computation.html#manual-parallelism-with-shard-map)
@@ -20,14 +20,14 @@ via `python3 -m llam4_jax`. Among other things, the model code demonstrates:
 * simple int8 quantization.
 
 This example aims to be a concise, self-contained, fully open-source codebase,
-with performance that is reasonably comparable to other Llama 4 inference
+with performance that is reasonably comparable to other Qwen 3 inference
 offerings (at cost). We hope that it is easy to understand and offers an
 accessible starting point for performant inference with JAX. See the
 [performance rundown](#inference-performance-results) below.
 
 In addition, this repo includes an
 [overview](#transformer-parallelism-strategies) of how to shard transformers and
-a [discussion](#optimizing-llama-4) of the specific optimizations used in
+a [discussion](#optimizing-qwen-3) of the specific optimizations used in
 this implementation, as well as a [workflow](#working-with-multi-host-clusters)
 for interactive development on multi-host GPU and TPU clusters using
 ipyparallel.
@@ -36,31 +36,32 @@ ipyparallel.
 - [Quickstart](#quickstart)
 - [Inference performance results](#inference-performance-results)
 - [Transformer parallelism strategies](#transformer-parallelism-strategies)
-- [Optimizing Llama 4](#optimizing-llama-4)
+- [Optimizing Qwen 3](#optimizing-qwen-3)
 - [Working with multi-host clusters](#working-with-multi-host-clusters)
 - [Next steps](#next-steps)
 
 ## Quickstart
 
-Due to the large model size (671B parameters), a multi-host platform is required to run
-the full model. We've tested on v5e-64.
+Due to the large model size (235B parameters), a multi-host platform is required to run
+the full model. We've tested on TODO.
 
 Run on all hosts in the TPU cluster:
 ```
-$ python3 -m llam4_jax
+$ python3 main.py
 ```
 e.g. for Cloud TPU:
 ```
 $ gcloud compute tpus tpu-vm ssh {TPU_NAME} --worker=all \
-    --command="cd ~/llama4_jax && python3 -m llam4_jax"
+    --command="cd ~/qwen3_jax && python3 main.py"
 ```
 
 Responses:
 ```
+Responses:
 [
-  "\n\nI'm Llama, a model designed by Meta. What's your name, or should I start guessing?<|eot|><|header_start|>assistant<|header_end|>\n\nI'm Llama, a",
-  "\n\nHear me, ye knaves! Gather 'round and heed my words, for I shall regale thee with tales of yonder skies and the",
-  "\n\nA question that requires precision!\n\nAs a computer program, I don't have personal preferences, taste buds, or a physical body. Therefore, I neither like nor"
+  "<think>\nOkay, the user is asking for my name. I need to respond clearly. My name is Qwen, and I'm a large language model developed", 
+  '<think>\nOkay, the user is asking for the weather described in long prose in Old English. First, I need to recall what Old English is like. It', 
+  '<think>\nOkay, the user is asking, "Do you like ice cream, be extremely precise." Hmm, first, I need to remember that I\'m an'
 ]
 ```
 
@@ -68,24 +69,11 @@ Responses:
 
 ## Inference performance results
 
-#### Llama 4 - Scout
+TODO
 
-| TPU     | batch size | context length | tok/s    | HBM BW util $^*$ | comments        |
-| :------ | ---------: | -------------: | -------: | ---------------: | :-------------- |
-| v5e-16  |          1 |           4096 |   85.5   | 71.7%            |                 |
-| v5e-16  |         16 |           4096 |   76.3   | 64.0%            |                 |
-| v5e-16  |         32 |           4096 |   73.0   | 61.2%            |                 |
-
-#### Llama 4 - Maverick
-
-| TPU     | batch size | context length | tok/s    | HBM BW util $^*$ | comments        |
-| :------ | ---------: | -------------: | -------: | ---------------: | :-------------- |
-
-TOOD
-
-Results generated using jax 0.5.3, Python 3.10.15. Cost computation based on
+<!--Results generated using jax 0.6.0, Python 3.12.3. Cost computation based on
 https://cloud.google.com/spot-vms/pricing, region `us-central1` as of Feb 28
-2025.
+2025.-->
 
 $^*$ HBM BW util computed from on-chip network size = 102 GB (Scout) and (TODO)
 (Maverick) and 819 GB/s theoretical TPU v5e HBM BW. For small batches, not all
@@ -93,10 +81,10 @@ experts are loaded from HBM leading to >100% utilization.
 
 ### Optimization Decisions
 
-Llama 4 is a fairly minimal MoE model in that it (i) uses grouped-query
+Qwen 3 MoE/Dense is a fairly minimal MoE model in that it (i) uses grouped-query
 attention, (GQA) and (ii) uses either a simple MLP layer with a gate, up and
 down projections or a simple MoE layer with the same linear matrices (but
-repeated for each expert).  This presents several opportunities in optimizing
+repeated for each expert). This presents several opportunities in optimizing
 the model for TPUs and GPUs to maximize either compute (in training) or
 memory-bandwidth use in inference.
 
@@ -145,7 +133,7 @@ TODO
 
 This section overviews different sharding strategies and their performance considerations for Transformer architectures in general.
 For a very in-depth guide on this topic, check out [How to Scale Your Model](https://jax-ml.github.io/scaling-book/). 
-The next section goes over Llama-specific optimizations.
+The next section goes over Qwen3-specific optimizations.
 
 A typical decoder-only transformer consists of
 
@@ -243,19 +231,19 @@ This, very roughly implies the trade-off (in favor of FDSP):
 
 $$ \mathcal{O} \left( D^2 \right ) \leq \mathcal{O}\left(B D \right) \rightarrow \mathcal{O}\left(D\right) \leq \mathcal{O}\left(B\right) $$
 
-FSDP can be more efficient if the the batch size is on the order of the model dimension. For fast latency Llama 4 Scout
+FSDP can be more efficient if the the batch size is on the order of the model dimension. For fast latency Qwen3-235B
 
 $$
-B = 16 ~~~ D = 5120
+B = 16 ~~~ D = 4096
 $$
 
 strongly implying a preference for tensor-parallelism (in the context of low-latency decoding).
 
-## Optimizing Llama 4
+## Optimizing Qwen 3
 
 ### MLP Layers (and shared expert) in Inference
 
-The MLP in the network is a fairly standard up-down MLP linear layer. Llama 4
+The MLP in the network is a fairly standard up-down MLP linear layer. Qwen 3
 uses either an MLP or an MoE layer (which contains an MLP layer referred to as
 shared expert) after every attention layer.
 

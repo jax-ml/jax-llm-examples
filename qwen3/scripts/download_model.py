@@ -4,9 +4,16 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 example_models = [
-  "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-  "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+  "Qwen/Qwen3-0.6B",
+  "Qwen/Qwen3-1.7B",
+  "Qwen/Qwen3-4B",
+  "Qwen/Qwen3-8B",
+  "Qwen/Qwen3-14B",
+  "Qwen/Qwen3-32B",
+  "Qwen/Qwen3-30B-A3B",
+  "Qwen/Qwen3-235B-A22B",
 ]
+
 
 def main(model_id: str, dest_root_path: str | Path):
     from huggingface_hub import snapshot_download

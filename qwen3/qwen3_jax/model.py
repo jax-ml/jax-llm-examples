@@ -76,11 +76,6 @@ class ShardingRules:
     kv_heads: AxisName = ATTN_HEADS_AXIS_NAME
     o_heads: AxisName = ATTN_HEADS_AXIS_NAME
     o_embed: AxisName = None
-    # MLP
-    embed_up: AxisName = None
-    ffw_up: AxisName = TENSOR_AXIS_NAME
-    ffw_down: AxisName = TENSOR_AXIS_NAME
-    embed_down: AxisName = None
     # MLP layer
     mlp_up_embed: AxisName = None
     mlp_up_ffw: AxisName = TENSOR_AXIS_NAME
@@ -92,10 +87,6 @@ class ShardingRules:
     moe_e_up_ffw: AxisName = TENSOR_ONLY_AXIS_NAME
     moe_e_down_ffw: AxisName = TENSOR_ONLY_AXIS_NAME
     moe_e_down_embed: AxisName = None
-    moe_s_up_embed: AxisName = None
-    moe_s_up_ffw: AxisName = TENSOR_ONLY_AXIS_NAME
-    moe_s_down_ffw: AxisName = TENSOR_ONLY_AXIS_NAME
-    moe_s_down_embed: AxisName = None
     moe_e_tp: AxisName = TENSOR_ONLY_AXIS_NAME  # moe forward function tensor parallelism
     moe_e_ep: AxisName = EXPERT_AXIS_NAME  # moe forward function expert parallelism
     # vocab
@@ -143,102 +134,60 @@ class Config:
     max_seq_len: int
     # Attention
     causal: bool
-    nope_layer_interval: int
-    use_qk_norm: bool
-    attn_chunk_size: int
-    # MLP
-    mlp_ffw_size: int
     # MoE
     moe_ffw_size: int
-    moe_layer_interval: int
     moe_experts_per_tok: int
     moe_num_experts: int
-    moe_num_shared_experts: int = 1
     moe_gate_dtype: "jnp.dtype" = jnp.float32
     ep_strategy: str = "decode"
+    # MLP
+    mlp_ffw_size: int = -1
+    mlp_layer_idxs: list[int] = dataclasses.field(default_factory=list)
     # kernel config
     use_prefill_attn_kernel: bool = False
     use_decode_attn_kernel: bool = False
     use_ragged_dot_kernel: bool = False
     dtype: "jnp.dtype" = jnp.bfloat16
-    norm_eps: float = 1e-5
+    norm_eps: float = 1e-6
     # sharding
     rules: ShardingRules = dataclasses.field(default_factory=ShardingRules)
     mesh: jax.sharding.Mesh | None = None
-    # Llama 3 specific frequency computation
     rope_theta: float = 500000.0
-    rope_scaling_factor: float = 8.0
-    rope_scaling_low_freq_factor: float = 1.0
-    rope_scaling_high_freq_factor: float = 4.0
-    rope_scaling_original_max_position_embeddings: int = 8192
-    quant_mlp: bool = False
     quant_moe: bool = False
+    quant_mlp: bool = False
     quant_attn: bool = False
     quant_cache: bool = True
     quant_scale_dtype: "jnp.dtype" = jnp.bfloat16
 
 
-def llama_to_jax_config(llama_config: Any | dict[str, Any]) -> "Config":
-    _get = lambda x, k, default=None: getattr(x, k, default) if hasattr(x, k) else dict(x).get(k, default)
-    nope_layer_interval = 4
-    return Config(
-        embed=_get(llama_config, "dim"),
-        mlp_ffw_size={1.2: 16384}[_get(llama_config, "ffn_dim_multiplier")],  # odd Llama calculation of hidden dim
-        moe_ffw_size={4: 8192}[_get(llama_config, "ffn_exp")],  # odd Llama calculation of hidden dim
-        q_heads=_get(llama_config, "n_heads"),
-        kv_heads=_get(llama_config, "n_kv_heads"),
-        num_layers=_get(llama_config, "n_layers"),
-        head_dim=_get(llama_config, "head_dim", None) if _get(llama_config, "head_dim", None) is not None else 128,
-        vocab_size=_get(llama_config, "vocab_size"),
-        norm_eps=_get(llama_config, "norm_eps"),
-        use_qk_norm=_get(llama_config, "use_qk_norm"),
-        attn_chunk_size=_get(llama_config, "attention_chunk_size"),
-        nope_layer_interval=nope_layer_interval,
-        moe_layer_interval=_get(llama_config, "moe_args")["interleave_moe_layer_step"],
-        moe_experts_per_tok=_get(llama_config, "moe_args")["top_k"],
-        moe_num_experts=_get(llama_config, "moe_args")["num_experts"],
-        max_seq_len=128,
-        dtype=jnp.bfloat16,
-        causal=True,
-        use_prefill_attn_kernel=False,
-        use_decode_attn_kernel=False,
-        rope_theta=_get(llama_config, "rope_theta"),
+def hf_to_jax_config(hf_config: Any | dict[str, Any]) -> "Config":
+    _get = lambda x, k, default=None: (
+        getattr(x, k, default) if not isinstance(hf_config, dict) else hf_config.get(k, default)
     )
-
-
-def hf_to_jax_config(llama_config: Any | dict[str, Any]) -> "Config":
-    _get = lambda x, k, default=None: getattr(x, k, default) if hasattr(x, k) else dict(x).get(k, default)
-    # num_layers = _get(llama_config, "num_hidden_layers")
-    # nope_layer_interval = round(num_layers / (num_layers - sum(_get(llama_config, "no_rope_layers"))))
-    nope_layer_interval = 4
     return Config(
-        embed=_get(llama_config, "hidden_size"),
-        mlp_ffw_size=_get(llama_config, "intermediate_size_mlp"),
-        moe_ffw_size=_get(llama_config, "intermediate_size"),
-        q_heads=_get(llama_config, "num_attention_heads"),
-        kv_heads=_get(llama_config, "num_key_value_heads"),
-        num_layers=_get(llama_config, "num_hidden_layers"),
-        head_dim=_get(llama_config, "head_dim"),
-        vocab_size=_get(llama_config, "vocab_size"),
-        norm_eps=_get(llama_config, "rms_norm_eps"),
-        use_qk_norm=_get(llama_config, "use_qk_norm"),
-        attn_chunk_size=_get(llama_config, "attention_chunk_size"),
-        nope_layer_interval=nope_layer_interval,
-        moe_layer_interval=_get(llama_config, "interleave_moe_layer_step"),
-        moe_experts_per_tok=_get(llama_config, "num_experts_per_tok"),
-        moe_num_experts=_get(llama_config, "num_local_experts"),
+        embed=_get(hf_config, "hidden_size"),
+        mlp_ffw_size=_get(hf_config, "intermediate_size", -1),
+        moe_ffw_size=_get(hf_config, "moe_intermediate_size", -1),
+        mlp_layer_idxs=_get(hf_config, "mlp_only_layers", []),
+        q_heads=_get(hf_config, "num_attention_heads"),
+        kv_heads=_get(hf_config, "num_key_value_heads"),
+        num_layers=_get(hf_config, "num_hidden_layers"),
+        head_dim=_get(hf_config, "head_dim"),
+        vocab_size=_get(hf_config, "vocab_size"),
+        norm_eps=_get(hf_config, "rms_norm_eps"),
+        moe_experts_per_tok=_get(hf_config, "num_experts_per_tok"),
+        moe_num_experts=_get(hf_config, "num_experts"),
         max_seq_len=128,
         dtype=jnp.bfloat16,
         causal=True,
         use_prefill_attn_kernel=False,
         use_decode_attn_kernel=False,
-        rope_theta=_get(llama_config, "rope_theta"),
+        rope_theta=_get(hf_config, "rope_theta"),
     )
 
 
 def load_config(config_path: str | os.PathLike[str] | Path) -> "Config":
-    # return llama_to_jax_config(json.loads(Path(config_path).read_text()))
-    return hf_to_jax_config(json.loads(Path(config_path).read_text())["text_config"])
+    return hf_to_jax_config(json.loads(Path(config_path).read_text()))
 
 
 def load_tokenizer(
@@ -387,6 +336,8 @@ class AttentionLayer(_Init):
     k: jax.Array | ArrayInfo | QuantArray
     v: jax.Array | ArrayInfo | QuantArray
     o: jax.Array | ArrayInfo | QuantArray
+    q_gamma: jax.Array | ArrayInfo | QuantArray
+    k_gamma: jax.Array | ArrayInfo | QuantArray
 
     ########################################################################################################################
     @classmethod
@@ -405,6 +356,8 @@ class AttentionLayer(_Init):
             o=ArrayInfo(
                 (cfg.q_heads, cfg.head_dim, cfg.embed), cfg.dtype, ("o_heads", "head_dim", "o_embed"), _init(1, 2)
             ),
+            q_gamma=ArrayInfo((cfg.head_dim,), cfg.dtype, ("head_dim",), jax.nn.initializers.ones),
+            k_gamma=ArrayInfo((cfg.head_dim,), cfg.dtype, ("head_dim",), jax.nn.initializers.ones),
         )
         layer = cls.quantize(layer, cfg)
         return layer
@@ -416,12 +369,11 @@ class AttentionLayer(_Init):
         scale_dtype = cfg.quant_scale_dtype
         return dataclasses.replace(
             layer,
-            q=QuantArray(*quantize(layer.q, (1, 2), scale_dtype)),
-            k=QuantArray(*quantize(layer.k, (1, 2), scale_dtype)),
-            v=QuantArray(*quantize(layer.v, (1, 2), scale_dtype)),
+            q=QuantArray(*quantize(layer.q, 0, scale_dtype), out_scaling=True, scale_expand_dims=-2),
+            k=QuantArray(*quantize(layer.k, 0, scale_dtype), out_scaling=True, scale_expand_dims=-2),
+            v=QuantArray(*quantize(layer.v, 0, scale_dtype), out_scaling=True, scale_expand_dims=-2),
             o=QuantArray(*quantize(layer.o, (0, 1), scale_dtype), out_scaling=True),
         )
-
 
 @jax_pytree_struct
 class MLPLayer(_Init):
@@ -462,10 +414,6 @@ class MoELayer(_Init):
     we_gate: jax.Array | ArrayInfo | QuantArray
     we_up: jax.Array | ArrayInfo | QuantArray
     we_down: jax.Array | ArrayInfo | QuantArray
-    # shared experts
-    ws_gate: jax.Array | ArrayInfo | QuantArray
-    ws_up: jax.Array | ArrayInfo | QuantArray
-    ws_down: jax.Array | ArrayInfo | QuantArray
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -491,25 +439,7 @@ class MoELayer(_Init):
                 dtype,
                 ("moe_e_experts", "moe_e_down_ffw", "moe_e_down_embed"),
                 _einit,
-            ),
-            ws_gate=ArrayInfo(
-                (cfg.embed, cfg.moe_num_shared_experts * cfg.moe_ffw_size),
-                dtype,
-                ("moe_s_up_embed", "moe_s_up_ffw"),
-                _sinit,
-            ),
-            ws_up=ArrayInfo(
-                (cfg.embed, cfg.moe_num_shared_experts * cfg.moe_ffw_size),
-                dtype,
-                ("moe_s_up_embed", "moe_s_up_ffw"),
-                _sinit,
-            ),
-            ws_down=ArrayInfo(
-                (cfg.moe_ffw_size, cfg.moe_num_shared_experts * cfg.embed),
-                dtype,
-                ("moe_s_down_ffw", "moe_s_down_embed"),
-                _sinit,
-            ),
+            )
         )
         layer = cls.quantize(layer, cfg)
         return layer
@@ -524,15 +454,12 @@ class MoELayer(_Init):
             we_gate=QuantArray(*quantize(layer.we_gate, 1, scale_dtype), out_scaling=True),
             we_up=QuantArray(*quantize(layer.we_up, 1, scale_dtype), out_scaling=True),
             we_down=QuantArray(*quantize(layer.we_down, 1, scale_dtype), out_scaling=True),
-            ws_gate=QuantArray(*quantize(layer.ws_gate, 0, scale_dtype), out_scaling=True),
-            ws_up=QuantArray(*quantize(layer.ws_up, 0, scale_dtype), out_scaling=True),
-            ws_down=QuantArray(*quantize(layer.ws_down, 0, scale_dtype), out_scaling=True),
         )
 
 
 @jax_pytree_struct
 class Layer(_Init):
-    mlp: MLPLayer | MoELayer
+    ffw: MoELayer | MLPLayer
     attn: AttentionLayer
     attn_pre_gamma: jax.Array | ArrayInfo
     attn_post_gamma: jax.Array | ArrayInfo
@@ -540,10 +467,9 @@ class Layer(_Init):
     ########################################################################################################################
     @classmethod
     def abstract(cls, cfg: Config, layer_idx: int) -> "Layer":
-        _init = lambda *out_axes: jax.nn.initializers.he_normal(in_axis=0, out_axis=out_axes)
-        use_moe = (layer_idx + 1) % cfg.moe_layer_interval == 0
+        is_moe = cfg.moe_ffw_size > 0 and (layer_idx not in cfg.mlp_layer_idxs)
         layer = Layer(
-            mlp=MoELayer.abstract(cfg) if use_moe else MLPLayer.abstract(cfg),
+            ffw=MoELayer.abstract(cfg) if is_moe else MLPLayer.abstract(cfg),
             attn=AttentionLayer.abstract(cfg),
             attn_pre_gamma=ArrayInfo((cfg.embed,), cfg.dtype, ("act_embed",), jax.nn.initializers.constant(1.0)),
             attn_post_gamma=ArrayInfo((cfg.embed,), cfg.dtype, ("act_embed",), jax.nn.initializers.constant(1.0)),
@@ -554,7 +480,7 @@ class Layer(_Init):
     @staticmethod
     def quantize(layer: "Layer", cfg: Config):
         return dataclasses.replace(
-            layer, mlp=layer.mlp.quantize(layer.mlp, cfg), attn=layer.attn.quantize(layer.attn, cfg)
+            layer, ffw=layer.ffw.quantize(layer.ffw, cfg), attn=layer.attn.quantize(layer.attn, cfg)
         )
 
 
@@ -628,27 +554,6 @@ def segment_ids_to_positions(segment_ids):
     return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
 
 
-def _llama4_rope_freq_correction(rotational_frequency: jax.Array, cfg: Config):
-    factor = cfg.rope_scaling_factor  # `8` in the original implementation
-    low_freq_factor = cfg.rope_scaling_low_freq_factor  # `1` in the original implementation
-    high_freq_factor = cfg.rope_scaling_high_freq_factor  # `4` in the original implementation
-    old_context_len = cfg.rope_scaling_original_max_position_embeddings  # `8192` in the original implementation
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-
-    wavelen = 2 * math.pi / rotational_frequency
-    # wavelen < high_freq_wavelen: do nothing
-    # wavelen > low_freq_wavelen: divide by factor
-    inv_freq_llama = jnp.where(wavelen > low_freq_wavelen, rotational_frequency / factor, rotational_frequency)
-    # otherwise: interpolate between the two, using a smooth factor
-    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
-    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
-    inv_freq_llama = jnp.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
-    return inv_freq_llama
-
-
 def _generate_pos_embeddings(
     # positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16384.0
     positions: jax.Array,
@@ -683,7 +588,6 @@ def _generate_pos_embeddings(
     fraction = jnp.arange(0, features, 2, dtype=jnp.float32) / features
     timescale = cfg.rope_theta**fraction
     rotational_frequency = 1.0 / timescale
-    rotational_frequency = _llama4_rope_freq_correction(rotational_frequency, cfg)
     # Must use high precision einsum here, since rounding off to a bfloat16 is catastrophic. bfloat16 rounds 257 to 256,
     # but sin(257) is very different from sin(256).
     sinusoid_inp = jnp.einsum(
@@ -698,11 +602,10 @@ def _generate_pos_embeddings(
 
 def apply_rotary_embedding(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
     assert x.ndim == 4 and sin.ndim == 3 and cos.ndim == 3
-    x_ = x.reshape(x.shape[:-1] + (-1, 2))
-    x1, x2 = x_[..., 0], x_[..., 1]
+    x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     # [B, T, head_dim] -> [B, h, T, head_dim]
     sin, cos = sin[:, None, :, :], cos[:, None, :, :]
-    return jnp.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).reshape(x.shape)
+    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
 
 def make_attention_mask(
@@ -712,7 +615,6 @@ def make_attention_mask(
     k_segment_ids,
     q_offset,
     causal: bool,
-    chunk_attn_size: int | None = None,
     starts: jax.Array | None = None,
 ):
     # [B, t, T]
@@ -728,11 +630,6 @@ def make_attention_mask(
         q_positions = q_iota + q_offset[:, None, None, None]
         causal_mask = q_positions >= k_iota
         combined_mask = jnp.logical_and(segment_mask, causal_mask)
-        if chunk_attn_size is not None:
-            assert starts is not None
-            starts_ = starts[:, None, None, None]
-            chunk_attn_mask = (q_positions - starts_) // chunk_attn_size == (k_iota - starts_) // chunk_attn_size
-            combined_mask = jnp.logical_and(combined_mask, chunk_attn_mask)
         return combined_mask
     else:
         return segment_mask
@@ -749,7 +646,6 @@ def attention(
     starts: jax.Array,
     lengths: jax.Array,
     cfg: Config,
-    attn_chunk_size: int | None = None,
 ) -> jax.Array:
     """
     Compute attention.
@@ -778,7 +674,7 @@ def attention(
     qk = qk.reshape((b, qh, t, T))
 
     del lengths
-    mask = make_attention_mask(t, T, q_segment_ids, k_segment_ids, q_offset, cfg.causal, attn_chunk_size, starts)
+    mask = make_attention_mask(t, T, q_segment_ids, k_segment_ids, q_offset, cfg.causal, starts)
 
     # Apply the combined mask
     qk = jnp.where(mask, qk, -1e30)
@@ -791,9 +687,7 @@ def attention(
     return qkv.reshape((b, qh, t, d))
 
 
-def attention_kernel(
-    q, k, v, q_segment_ids, kv_segment_ids, q_offset, starts, lengths, cfg: Config, attn_chunk_size: int | None = None
-):
+def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, q_offset, starts, lengths, cfg: Config):
     """Flash attention kernel!"""
 
     # On TPUv3, pallas seems to only work with float32.
@@ -808,9 +702,16 @@ def attention_kernel(
 
     l2p = lambda *logical: logical_to_physical(logical, cfg.rules)
 
+    kv_repeats = q.shape[-3] // k.shape[-3]
+    q_spec = P(
+        *(l2p("batch", "kv_heads") + tuple(set(*l2p("q_heads")) - set(*l2p("kv_heads"))) + l2p("sequence", "head_dim"))
+    )
+    q_shape__ = q.shape
+    q = jax.lax.reshape(q, (q.shape[:-3] + (k.shape[-3], kv_repeats, q.shape[-2], q.shape[-1])), out_sharding=q_spec)
+
     # shard_map
     in_specs = (
-        l2p("batch", "q_heads", "sequence", "head_dim"),
+        q_spec,
         l2p("batch", "kv_heads", "sequence", "head_dim"),
         l2p("batch", "kv_heads", "sequence", "head_dim"),
         l2p("batch", "sequence"),
@@ -820,32 +721,20 @@ def attention_kernel(
     )
     in_specs += (None if k_scale is None else l2p("batch", "kv_heads", "sequence"),)
     in_specs += (None if v_scale is None else l2p("batch", "kv_heads", "sequence"),)
-    out_specs = l2p("batch", "q_heads", "sequence", "head_dim")
+    out_specs = q_spec
 
     @partial(shard_map, mesh=cfg.mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False)
     def _f(q, k, v, q_segment_ids, kv_segment_ids, starts, lengths, k_scale, v_scale):
         q_org_shape = q.shape
-        kv_repeats = q.shape[-3] // k.shape[-3]
-        q = q.reshape(q.shape[:-3] + (k.shape[-3], kv_repeats, q.shape[-2], q.shape[-1]))
 
         if q.shape[-2] != 1:
-            mask = mask_lib.CausalMask((q.shape[-2], k.shape[-2]))
-            if attn_chunk_size is not None:
-                # map segment ids to enforce chunk local attention
-                # this is incompatible with sequence packing, we're assuming 1 segment per row
-                local_q_segment_ids = ((jnp.arange(q_segment_ids.shape[-1]) - starts[:, None]) // attn_chunk_size) + 1
-                q_segment_ids = jnp.where((q_segment_ids != 0) & (local_q_segment_ids > 0), q_segment_ids, 0)
-                local_kv_segment_ids = ((jnp.arange(kv_segment_ids.shape[-1]) - starts[:, None]) // attn_chunk_size) + 1
-                kv_segment_ids = jnp.where((kv_segment_ids != 0) & (local_kv_segment_ids > 0), local_kv_segment_ids, 0)
-                # add sliding window attention mask to lower bound the chunk local attention sparsity
-                local_window_mask = mask_lib.LocalMask((q.shape[-2], k.shape[-2]), (attn_chunk_size, None), 0)
-                mask = mask_lib.LogicalAnd(mask, local_window_mask)
-            mask = mask_lib.MultiHeadMask([mask for _ in range(q.shape[-3])])
-            segment_ids = splash.SegmentIds(q=q_segment_ids, kv=kv_segment_ids)
+            mask = mask_lib.MultiHeadMask([mask_lib.CausalMask((q.shape[-2], k.shape[-2])) for _ in range(q.shape[-3])])
             block_q, block_kv = min(q.shape[-2], 512), min(k.shape[-2], 1024)
             block_sizes = splash.BlockSizes(block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv)
             attn_fn = splash.make_splash_mqa_single_device(mask=mask, block_sizes=block_sizes)
             attn_fn = jax.vmap(jax.vmap(attn_fn, in_axes=(0, 0, 0, None)), in_axes=(0, 0, 0, 0))
+
+            segment_ids = splash.SegmentIds(q=q_segment_ids, kv=kv_segment_ids)
             if k_scale is not None:
                 k = (k * k_scale[..., None]).astype(jnp.bfloat16)
             if v_scale is not None:
@@ -858,16 +747,14 @@ def attention_kernel(
             in_axes += ((None if k_scale is None else 1),)
             in_axes += ((None if v_scale is None else 1),)
             hyperparams = dict(scale=scale, block_kv=512, block_bs=32)
-            if attn_chunk_size:
-                # bring starts up to the beginning of the current block
-                starts = jnp.maximum(starts, ((lengths - starts) // attn_chunk_size) * attn_chunk_size + starts)
             ret = jax.vmap(partial(ragged_attention.ragged_decode_fwd, **hyperparams), in_axes=in_axes, out_axes=1)(
                 q, k, v, starts, lengths, k_scale, v_scale
             )
         return ret.reshape(q_org_shape)
 
     lengths = jnp.broadcast_to(lengths, starts.shape)
-    return _f(q, k, v, q_segment_ids, kv_segment_ids, starts, lengths, k_scale, v_scale).astype(jnp.bfloat16)
+    ret = _f(q, k, v, q_segment_ids, kv_segment_ids, starts, lengths, k_scale, v_scale).astype(jnp.bfloat16)
+    return jax.lax.reshape(ret, q_shape__, out_sharding=l2p("batch", "q_heads", "sequence", "head_dim"))
 
 
 def rms_norm(x: jax.Array, gamma: jax.Array | None, eps: jax.Array | float) -> jax.Array:
@@ -879,7 +766,7 @@ def rms_norm(x: jax.Array, gamma: jax.Array | None, eps: jax.Array | float) -> j
 def attention_block(
     x: jax.Array,
     segment_ids: jax.Array,
-    layer: Layer,
+    layer: AttentionLayer,
     sin: jax.Array,
     cos: jax.Array,
     cfg: Config,
@@ -898,11 +785,8 @@ def attention_block(
 
     # Apply rotary embeddings
     with jax.named_scope("rope"):
-        is_nope = (idx + 1) % cfg.nope_layer_interval == 0
-        if not is_nope:
-            q, k = apply_rotary_embedding(q, sin, cos), apply_rotary_embedding(k, sin, cos)
-            if cfg.use_qk_norm:
-                q, k = rms_norm(q, None, cfg.norm_eps), rms_norm(k, None, cfg.norm_eps)
+        q, k = rms_norm(q, layer.q_gamma, cfg.norm_eps), rms_norm(k, layer.k_gamma, cfg.norm_eps)
+        q, k = apply_rotary_embedding(q, sin, cos), apply_rotary_embedding(k, sin, cos)
 
     with jax.named_scope("cache_update"):
         if cache is not None:
@@ -927,11 +811,10 @@ def attention_block(
     # Compute attention
     with jax.named_scope("attention"):
         attn_args = (q, k, v, q_segment_ids, k_segment_ids, q_offset, starts, lengths)
-        attn_chunk_size = None if not is_nope else cfg.attn_chunk_size
         if (cfg.use_prefill_attn_kernel and q.shape[-2] != 1) or (cfg.use_decode_attn_kernel and q.shape[-2] == 1):
-            attn_out = attention_kernel(*attn_args, cfg=cfg, attn_chunk_size=attn_chunk_size)
+            attn_out = attention_kernel(*attn_args, cfg=cfg)
         else:
-            attn_out = attention(*attn_args, cfg, attn_chunk_size=attn_chunk_size)
+            attn_out = attention(*attn_args, cfg)
 
     # Project attention output
     with jax.named_scope("projection"):
@@ -953,8 +836,8 @@ def _route_tokens_to_moe_experts(x: jax.Array, weight: jax.Array, replicated_rou
     weight = lsc(weight, (None, None))
 
     scores = jnp.einsum("Sk,kj->Sj", x, weight).astype(cfg.moe_gate_dtype)
-    topk_weights, topk_idx = jax.lax.top_k(scores, cfg.moe_experts_per_tok)
-    topk_weights = jax.nn.sigmoid(topk_weights)
+    topk_weights, topk_idx = jax.lax.top_k(jax.nn.softmax(scores, axis=-1), cfg.moe_experts_per_tok)
+    topk_weights = topk_weights / jnp.sum(topk_weights, axis=-1, keepdims=True)
     topk_weights = lsc(topk_weights, (None, None)).reshape(x_shape[:-1] + (cfg.moe_experts_per_tok,))
     topk_idx = lsc(topk_idx, (None, None)).reshape(x_shape[:-1] + (cfg.moe_experts_per_tok,))
     return topk_weights, topk_idx
@@ -984,7 +867,7 @@ def _moe_gmm(lhs, rhs, group_sizes, topk_idx, cfg: Config):
     return ret.astype(cfg.dtype)
 
 
-def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
+def moe_block(x: jax.Array, layer: MoELayer, cfg: Config):
     assert x.ndim == 3
     l2p = lambda *axes: logical_to_physical(axes, cfg.rules)
     _psc = lambda z, spec: reshard(z, P(*spec))
@@ -1056,7 +939,6 @@ def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
             sort_idx_[:, None] // e,
             axis=-2,  # index trick to avoid jnp.repeat
         )  # [b * s * e, d]
-        x_repeat_sort_ = x_repeat_sort_ * topk_weights.reshape(-1)[sort_idx_][..., None]
 
         group_sizes = jnp.bincount(topk_idx_sort_, length=cfg.moe_num_experts)
         group_sizes_shard = jax.lax.dynamic_slice_in_dim(group_sizes, expert_idx * expert_size, expert_size, 0)
@@ -1077,6 +959,7 @@ def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
             pad_size = rs_shape - ff_out.shape[-1]
             ff_out = jnp.pad(ff_out, ((0, 0), (0, pad_size)))
             ff_out = jax.lax.psum_scatter(ff_out, axis_name=tensor_axname, scatter_dimension=1, tiled=True)
+        ff_out = ff_out * topk_weights.reshape(-1)[sort_idx_][:, None]
 
         if cfg.ep_strategy == "prefill":
             with jax.named_scope("unpermute"):
@@ -1122,10 +1005,7 @@ def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
     with jax.named_scope("moe_routed_expert"):
         x_ = psc(x, x_spec)
         ff_out_expert = _expert_fn(x_, we_gate, we_up, we_down, topk_weights, topk_idx)[..., : x.shape[-1]]
-    with jax.named_scope("moe_shared_expert"):
-        ff_out_shared = mlp_block(x, MLPLayer(layer.ws_gate, layer.ws_up, layer.ws_down), cfg)[..., : x.shape[-1]]
-    return psc(ff_out_expert + ff_out_shared, l2p("batch", "sequence", "act_embed"))
-
+    return psc(ff_out_expert, l2p("batch", "sequence", "act_embed"))
 
 def mlp_block(x: jax.Array, layer: Layer, cfg: Config):
     l2p = lambda *specs: logical_to_physical(specs, cfg.rules)
@@ -1139,7 +1019,6 @@ def mlp_block(x: jax.Array, layer: Layer, cfg: Config):
             "btf,fd->btd", ff_gate * ff_up, layer.w_down, out_sharding=l2p("batch", "sequence", "act_embed")
         ).astype(dtype)
     return ff_out
-
 
 def forward_layer(
     x: jax.Array,
@@ -1164,7 +1043,7 @@ def forward_layer(
     with jax.named_scope("attn_post_norm"):
         ff_in = rms_norm(x, layer.attn_post_gamma, cfg.norm_eps)
     with jax.named_scope("ffn"):
-        ff_out = (mlp_block if is_type(layer.mlp, MLPLayer) else moe_block_ep)(ff_in, layer.mlp, cfg)
+        ff_out = (moe_block if is_type(layer.ffw, MoELayer) else mlp_block)(ff_in, layer.ffw, cfg)
     with jax.named_scope("residual"):
         x = x + ff_out.astype(cfg.dtype)
 

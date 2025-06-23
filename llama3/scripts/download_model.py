@@ -4,9 +4,13 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 example_models = [
-  "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-  "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+  "meta-llama/Llama-3.1-8B-Instruct",
+  "meta-llama/Llama-3.1-70B-Instruct",
+  "meta-llama/Llama-3.1-405B-Instruct",
+  "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+  "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
 ]
+
 
 def main(model_id: str, dest_root_path: str | Path):
     from huggingface_hub import snapshot_download

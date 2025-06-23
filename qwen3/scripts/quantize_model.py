@@ -7,11 +7,11 @@ from argparse import ArgumentParser
 
 def main(path: str | Path, suffix: str):
     try:
-        from llama4_jax import chkpt_utils as utils
+        from qwen3_jax import chkpt_utils as utils
     except ImportError:
         sys.path.append(str(Path(__file__).parents[1].absolute()))
 
-        from llama4_jax import chkpt_utils as utils
+        from qwen3_jax import chkpt_utils as utils
 
     path = Path(path).expanduser().absolute()
     dest_path = path.parent / f"{path.name}{suffix}"
@@ -21,7 +21,7 @@ def main(path: str | Path, suffix: str):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "--path", default="~/DeepSeek-R1-Distill-Llama-70B", required=True, help="Existing JAX model checkpoint path"
+        "--path", default="~/Qwen3-30B-A3B", required=True, help="Existing JAX model checkpoint path"
     )
     parser.add_argument(
         "--suffix",

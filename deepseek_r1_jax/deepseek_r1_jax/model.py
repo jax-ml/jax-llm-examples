@@ -27,6 +27,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from jax import random
 from jax import tree_util
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as splash
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
@@ -36,7 +37,6 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from .decode_ragged_dot import decode_ragged_dot
 
 
-map, builtin_map = jax.util.safe_map, map
 AxisName = str | tuple[str, ...] | None
 Axes = tuple[AxisName, ...]
 
@@ -304,15 +304,15 @@ def quantize(x: jax.Array | ArrayInfo, axis: int | tuple[int, ...], scale_dtype=
         axis = tuple(z % len(x.shape) for z in axis)
         new_shape = tuple(ax for i, ax in enumerate(x.shape) if i not in axis)
         new_logical_axes = tuple(ax for i, ax in enumerate(x.logical_axes) if i not in axis)
+        quant_init = lambda key, shape, dtype=jnp.int8: random.randint(key, shape, -128, 128, dtype=dtype)
+        scale_init = (
+            lambda key, shape, dtype=scale_dtype: random.normal(key, shape, dtype=dtype)
+            / math.sqrt(math.prod(shape))
+            / 127
+        )
         return (
-            dataclasses.replace(x, shape=x.shape, dtype=jnp.int8, initializer=jax.nn.initializers.zeros),
-            ArrayInfo(
-                new_shape,
-                scale_dtype,
-                new_logical_axes,
-                jax.nn.initializers.ones,
-                metadata={"quant_axis": axis},
-            ),
+            dataclasses.replace(x, shape=x.shape, dtype=jnp.int8, initializer=quant_init),
+            ArrayInfo(new_shape, scale_dtype, new_logical_axes, scale_init, metadata={"quant_axis": axis}),
         )
 
     raise ValueError(f"quantize got unexpected type: {type(x)}")

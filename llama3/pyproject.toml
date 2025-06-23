@@ -1,7 +1,7 @@
 [project]
-name = "llama4_jax"
+name = "llama3_jax"
 version = "0.1.0"
-description = "Pure JAX implementation of Llama 4 inference, including a checkpoint converter for the weights."
+description = ""
 authors = [
     { name = "Robert Dyro" },
 ]
@@ -13,7 +13,6 @@ dependencies = [
     "jax",
     "torch",
     "transformers",  # for the model config and the tokenizer
-    "tune_jax",
     "tqdm",
     "numpy",
     "orbax-checkpoint",
@@ -42,6 +41,9 @@ indent-width = 4
 ignore = [
     "E731", # lambdas expression instead of def
 ]
+
+[tool.setuptools]
+packages = ["llama3_jax"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["pyproject.toml"] }

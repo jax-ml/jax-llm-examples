@@ -2,20 +2,20 @@
 
 import sys
 from pathlib import Path
+from pprint import pprint
 from argparse import ArgumentParser
 import dataclasses
 import shutil
 
-
 def main(model_path: str | Path, ckpt_path: str | Path):
     try:
-        from llama4_jax import model as l4jax
-        from llama4_jax import chkpt_utils as utils
+        from qwen3_jax import model as q3jax
+        from qwen3_jax import chkpt_utils as utils
     except ImportError:
         sys.path.append(str(Path(__file__).parents[1].absolute()))
 
-        from llama4_jax import model as l4jax
-        from llama4_jax import chkpt_utils as utils
+        from qwen3_jax import model as q3jax
+        from qwen3_jax import chkpt_utils as utils
 
     from transformers import AutoConfig
     from safetensors import safe_open
@@ -26,11 +26,11 @@ def main(model_path: str | Path, ckpt_path: str | Path):
     assert len(files) > 1
     config_files = list(model_path.glob("**/config.json"))
     assert len(config_files) == 1, "Must have only one `config.json` file in the model path"
-    config = AutoConfig.from_pretrained(config_files[0]).text_config
-    cfg = l4jax.hf_to_jax_config(config)
+    config = AutoConfig.from_pretrained(config_files[0])
+    cfg = q3jax.hf_to_jax_config(config)
 
-    # Llama 4 model checkppints are distributed unquantized
-    weights = l4jax.Weights.abstract(dataclasses.replace(cfg, quant_moe=False, quant_mlp=False, quant_attn=False))
+    # Qwen 3 model checkpoints are distributed unquantized
+    weights = q3jax.Weights.abstract(dataclasses.replace(cfg, quant_moe=False, quant_mlp=False, quant_attn=False))
 
     if not ckpt_path.exists():
         model = {}
@@ -38,8 +38,8 @@ def main(model_path: str | Path, ckpt_path: str | Path):
             with safe_open(file, framework="torch") as f:
                 for key in tqdm(f.keys(), leave=False):
                     model[key] = f.get_tensor(key)
-        converted_weights = utils.convert_model_or_layer(weights, model, cfg, sequential=False, prefix="language_model.")
-        l4jax.save_pytree(converted_weights, ckpt_path)
+        converted_weights = utils.convert_model_or_layer(weights, model, cfg, sequential=False)
+        q3jax.save_pytree(converted_weights, ckpt_path)
 
     additional_files = ["config.json", "tokenizer.json", "tokenizer_config.json"]
     for additional_file in additional_files:
@@ -55,11 +55,11 @@ def main(model_path: str | Path, ckpt_path: str | Path):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "--source-path", default="~/DeepSeek-R1-Distill-Llama-70B", required=True, help="HF model directory path"
+        "--source-path", default="~/Qwen3-30B-A3B", required=True, help="HF model directory path"
     )
     parser.add_argument(
         "--dest-path",
-        default="~/DeepSeek-R1-Distill-Llama-3.1-70B-Instruct",
+        default="~/qwen3_jax/Qwen3-30B-A3B",
         required=True,
         help="JAX model model directory (to be created).",
     )
