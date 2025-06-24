@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from pprint import pprint
+import os.path
 from argparse import ArgumentParser
 import dataclasses
 import shutil
@@ -22,9 +22,9 @@ def main(model_path: str | Path, ckpt_path: str | Path):
     from tqdm import tqdm
 
     model_path, ckpt_path = Path(model_path).expanduser(), Path(ckpt_path).expanduser()
-    files = list(model_path.glob("**/*safetensors"))
+    files = list(model_path.glob(os.path.join("**", "*safetensors")))
     assert len(files) > 1
-    config_files = list(model_path.glob("**/config.json"))
+    config_files = list(model_path.glob(os.path.join("**", "config.json")))
     assert len(config_files) == 1, "Must have only one `config.json` file in the model path"
     config = AutoConfig.from_pretrained(config_files[0])
     cfg = q3jax.hf_to_jax_config(config)
@@ -43,7 +43,7 @@ def main(model_path: str | Path, ckpt_path: str | Path):
 
     additional_files = ["config.json", "tokenizer.json", "tokenizer_config.json"]
     for additional_file in additional_files:
-        full_paths = list(model_path.glob(f"**/{additional_file}"))
+        full_paths = list(model_path.glob(os.path.join("**", additional_file)))
         if len(full_paths) != 1:
             print(f"Found more than 1 file for {additional_file}")
         if len(full_paths) == 0:
@@ -55,11 +55,11 @@ def main(model_path: str | Path, ckpt_path: str | Path):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "--source-path", default="~/Qwen3-30B-A3B", required=True, help="HF model directory path"
+        "--source-path", default=Path("~").expanduser() / "Qwen3-30B-A3B", required=True, help="HF model directory path"
     )
     parser.add_argument(
         "--dest-path",
-        default="~/qwen3_jax/Qwen3-30B-A3B",
+        default=Path("~").expanduser() / "qwen3_jax" / "Qwen3-30B-A3B",
         required=True,
         help="JAX model model directory (to be created).",
     )

@@ -21,7 +21,7 @@ def main(path: str | Path, suffix: str):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "--path", default="~/Qwen3-30B-A3B", required=True, help="Existing JAX model checkpoint path"
+        "--path", default=Path("~").expanduser() / "Qwen3-30B-A3B", required=True, help="Existing JAX model checkpoint path"
     )
     parser.add_argument(
         "--suffix",

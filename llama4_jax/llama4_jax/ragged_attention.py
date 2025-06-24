@@ -10,6 +10,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+
 import numpy as np
 
 NUM_LANES = 128

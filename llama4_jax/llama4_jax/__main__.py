@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import dataclasses
+import os
+
 from etils import epath
 import json
 
@@ -39,9 +41,9 @@ def encode_input(tokenizer, texts, pad_id: int = 0):
 
 if __name__ == "__main__":
     jax.distributed.initialize()
-    quant = True
+    quant = os.environ.get("QUANT") in (None, 't', 'T', 'True', 'true', 'TRUE', 1)
 
-    ckpt_path = epath.Path("~/bucket/Llama-4-Scout-Instruct").expanduser()
+    ckpt_path = epath.Path("~").expanduser()  / "bucket" / "Llama-4-Scout-Instruct"
     if quant:
         ckpt_path = ckpt_path.parent / f"{ckpt_path.name}-quant"
     tokenizer = l4jax.load_tokenizer(ckpt_path / "tokenizer.json", ckpt_path / "tokenizer_config.json")

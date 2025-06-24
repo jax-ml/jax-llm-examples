@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import dataclasses
+import os
+
 from etils import epath
 import json
 from pprint import pprint
@@ -41,9 +43,9 @@ def encode_input(tokenizer, texts: list[str], model_name: str, pad_id: int = 0):
 
 if __name__ == "__main__":
     jax.distributed.initialize()
-    quant = True
+    quant = os.environ.get("QUANT") in (None, 't', 'T', 'True', 'true', 'TRUE', 1)
 
-    ckpt_path = epath.Path("~/bucket/DeepSeek-R1-Distill-Llama-3.1-70B-Instruct").expanduser()
+    ckpt_path = epath.Path("~").expanduser() / "bucket" / "DeepSeek-R1-Distill-Llama-3.1-70B-Instruct"
     if quant:
         ckpt_path = ckpt_path.parent / f"{ckpt_path.name}-quant"
     tokenizer = l3jax.load_tokenizer(ckpt_path / "tokenizer.json", ckpt_path / "tokenizer_config.json")

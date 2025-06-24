@@ -10,16 +10,17 @@ requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 
 dependencies = [
+    "datasets",
+    "etils",
+    "gcsfs",
+    "huggingface-hub",
     "jax",
-    "torch",
-    "transformers",  # for the model config and the tokenizer
-    "tune_jax",
-    "tqdm",
     "numpy",
     "orbax-checkpoint",
-    "datasets",
-    "gcsfs",
-    "etils",
+    "torch",
+    "tqdm",
+    "transformers",  # for the model config and the tokenizer
+    "tune_jax",
 ]
 
 # we don't need CUDA torch

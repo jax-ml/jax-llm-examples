@@ -21,6 +21,7 @@ from jax import numpy as jnp
 from jax import random
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
 from tqdm import tqdm
 
 

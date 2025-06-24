@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import json
-import safetensors
 from pathlib import Path
+
+import safetensors
+
 from tqdm import tqdm
 
 if __name__ == "__main__":
