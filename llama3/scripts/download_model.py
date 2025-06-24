@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os.path
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -27,7 +28,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dest-root-path",
         required=True,
-        default="~/",
+        default=os.path.join(os.path.expanduser("~"), ""),
         help="Destination root directory, the model will be saved into its own directory.",
     )
     args = parser.parse_args()

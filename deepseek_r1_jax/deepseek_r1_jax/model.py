@@ -20,10 +20,11 @@ from dataclasses import field
 from functools import partial
 from typing import Callable
 import tempfile
-from etils import epath
 import gzip
 import json
 from pathlib import Path
+
+from etils import epath
 
 import jax
 import jax.numpy as jnp
