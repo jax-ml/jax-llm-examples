@@ -36,9 +36,6 @@ def main(model_path: str | Path, ckpt_path: str | Path):
 
     additional_files = ["config.json", "tokenizer.json", "tokenizer_config.json"]
     for additional_file in additional_files:
-        full_paths = list(model_path.glob(f"**/{additional_file}"))
-        PurePath('**/').full_match('*.py')
-
         full_paths = list(model_path.glob(Path("~").expanduser() / "DeepSeek-R1-Distill-Llama-70B"))
         if len(full_paths) != 1:
             print(f"Found more than 1 file for {additional_file}")
