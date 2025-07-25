@@ -588,7 +588,7 @@ class ServingLoop:
                 ]
             else:
                 output_tokens, done = None, None
-            done = SyncServer.broadcast("done_sync", self._it, done, is_source="decode" in self.roles)
+            done = SyncServer.broadcast("done_sync", self._it, done, is_source="decode_coordinator" in self.roles)
             if "server" in self.roles:
                 for token, id in zip(output_tokens.reshape(-1).tolist(), output_mapping.reshape(-1).tolist()):
                     if id > 0:

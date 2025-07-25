@@ -63,8 +63,8 @@ def _place_local(tree, sharding: NamedSharding, present: bool):
 
 def load_model():
     global SERVE_LOOP, SERVING_THREAD, TOKENIZER
-    process_idx = int(socket.gethostname().split("-")[-1]) - 1  # a scheme where hosts are (host-1, host-2, ...)
-    jax.distributed.initialize(os.environ["COORDINATOR_ADDRESS"], 2, process_idx)
+    #process_idx = int(socket.gethostname().split("-")[-1]) - 1  # a scheme where hosts are (host-1, host-2, ...)
+    #jax.distributed.initialize(os.environ["COORDINATOR_ADDRESS"], 2, process_idx)
     print(jax.devices())
     print("-" * 80)
     print(jax.local_devices())
@@ -78,8 +78,9 @@ def load_model():
 
     # two hosts, different device and host meshes
     local_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.local_devices(), axis_types=(AxisType.Explicit,) * 3)
-    decode_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[:8], axis_types=(AxisType.Explicit,) * 3)
-    prefill_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[8:], axis_types=(AxisType.Explicit,) * 3)
+    decode_mesh, prefill_mesh = local_mesh, local_mesh
+    #decode_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[:8], axis_types=(AxisType.Explicit,) * 3)
+    #prefill_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[8:], axis_types=(AxisType.Explicit,) * 3)
 
     # single host, same decode and prefill meshes
     #local_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.local_devices(), axis_types=(AxisType.Explicit,) * 3)
@@ -94,12 +95,14 @@ def load_model():
     cfg = dataclasses.replace(cfg, mesh=decode_mesh, quant_layer=True, quant_cache=True)
     cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=False, use_decode_attn_kernel=False, max_seq_len=8192)
     cfg = dataclasses.replace(cfg, quant_layer=False, quant_cache=False)
+    cfg.quant_cache = True
 
     weights = l3jax.load_pytree(ckpt_path, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=local_mesh)))
 
     # multi-host: until orbax update
-    decode_weights = _place_local(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=decode_mesh)), present=jax.process_index() == 0)
-    prefill_weights = _place_local(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=prefill_mesh)), present=jax.process_index() == 1)
+    decode_weights, prefill_weights = weights, weights
+    #decode_weights = _place_local(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=decode_mesh)), present=jax.process_index() == 0)
+    #prefill_weights = _place_local(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=prefill_mesh)), present=jax.process_index() == 1)
 
     # single-host: until orbax update
     #decode_weights = serving.device_put(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=decode_mesh)))
@@ -108,7 +111,7 @@ def load_model():
     print("---> Weights loaded")
 
     serve_cfg = serving.ServingConfig(decode_steps=32, max_decode_length=64)
-    # decode_cache = l3jax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size)
+    #decode_cache = l3jax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size)
     decode_cache = l3jax.PagedKVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, 2048, 32)
     SERVE_LOOP = serving.ServingLoop(
         serve_cfg, cfg, l3jax.prefill, prefill_weights, l3jax.decode_step, decode_weights, decode_cache
@@ -122,7 +125,7 @@ def load_model():
         finally:
             print("Received a shutdown signal")
             time.sleep(0.1)
-            signal.raise_signal(signal.SIGINT)  # shut down the web server
+            signal.raise_signal(signal.SIGKILL)  # shut down the web server
         print("Exiting the serving loop")
 
     SERVING_THREAD = threading.Thread(target=serve_forever)

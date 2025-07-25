@@ -19,6 +19,8 @@ dependencies = [
     #"datasets",
     "gcsfs",
     "etils",
+    "importlib_resources",
+    "absl-py",
 ]
 
 # we don't need CUDA torch

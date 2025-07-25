@@ -18,6 +18,13 @@ next_power_of_2 = lambda x: 2 ** math.ceil(math.log2(max(x, 1)))
 _pad_after = lambda x, l, axis: jnp.pad(x, [(0, 0) if i != axis else (0, l - x.shape[i]) for i in range(x.ndim)])
 
 
+def safe_zip(*args):
+  if len(args) == 0:
+    return []
+  assert all(len(arg) == len(args[0]) for arg in args)
+  return zip(*args)
+
+
 def _transpose_attention_tree(kv_list: list[PyTree], time_axis: int):
     "From a list of cache entries stacked along layer idx (in transit) to stacked along batch, layers split into list."
 
@@ -28,7 +35,7 @@ def _transpose_attention_tree(kv_list: list[PyTree], time_axis: int):
     for i, c in enumerate(kv_list[0]):
         els = [[_split(z) for z in jax.tree.leaves(kv[i])] for kv in kv_list]  # [B, R_flat, L]
         els = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *els)  # [R_flat, L]
-        leaves_list = list(zip(*els))  # [L, R_flat]
+        leaves_list = list(safe_zip(*els))  # [L, R_flat]
         out[i] = [jax.tree.unflatten(jax.tree.structure(c), leaves) for leaves in leaves_list]  # [L, R]
     return tuple(out), max_seq_len
 
@@ -41,7 +48,7 @@ def _transpose_attention_tree(kv_list: list[PyTree], time_axis: int):
 @partial(jax.jit, donate_argnames=("cache",))
 def _kvcache_update_cache(
     cache: KVCache,
-    kvs: list[tuple[list[jax.Array | QuantArray], list[jax.Array | QuantArray]]],
+    kvs: list[tuple[jax.Array | QuantArray, ...]],
     batch_idxs: list[jax.Array],
     actual_lens: list[jax.Array],
     update_mask: list[bool] | None = None,
@@ -62,15 +69,17 @@ def _kvcache_update_cache(
         # update_permute = [batch_dim, time_dim] + update_permute
         return x.at[batch_idxs[:, None], :, time_indices, ...].set(u.transpose(update_permute), mode="drop")
 
-    cache_k, cache_v = jax.tree.map(_update_element, (cache.k, cache.v), kvs)
+    cache_kvs = jax.tree.map(_update_element, cache.buffers, kvs)
     cache_starts = cache.starts.at[batch_idxs].set(start_time, mode="drop")
     cache_iter = jnp.where(uninitialized_cache, jnp.max(actual_lens), cache.iter)
-    return dataclasses.replace(cache, k=cache_k, v=cache_v, iter=cache_iter, starts=cache_starts)
+
+    buffer_names = [field.name for field in dataclasses.fields(cache)][:len(cache_kvs)]
+    return dataclasses.replace(cache, **dict(safe_zip(buffer_names, cache_kvs)), iter=cache_iter, starts=cache_starts)
 
 
 def kvcache_update_cache(
     cache: KVCache,
-    kvs: list[tuple[list[jax.Array | QuantArray], list[jax.Array | QuantArray]]],
+    kvs: list[tuple[jax.Array | QuantArray, ...]],
     batch_idxs: list[jax.Array],
     actual_lens: list[jax.Array],
 ):
@@ -85,7 +94,7 @@ def kvcache_update_cache(
 def kvcache_get_entry(cache: KVCache, batch_idx: jax.Array):
     shift = -cache.starts[batch_idx]
     assert cache.time_axis > 0
-    kvs = jax.tree.map(lambda x: jnp.roll(x[batch_idx, ...], shift=shift, axis=cache.time_axis - 1), (cache.k, cache.v))
+    kvs = jax.tree.map(lambda x: jnp.roll(x[batch_idx, ...], shift=shift, axis=cache.time_axis - 1), cache.buffers)
     kvs = (jax.tree.map(lambda *xs: jnp.stack(xs, 0), kvs[0]), jax.tree.map(lambda *xs: jnp.stack(xs, 0), kvs[1]))
     true_len = cache.fill_len()[batch_idx]
     return kvs, true_len
@@ -109,13 +118,13 @@ def _find_empty_pages(free_pages: jax.Array, k: int, proposal_pages: jax.Array |
         return jax.lax.top_k(free_pages, k)[1]
 
 
-def _paged_update_slice(cache: PagedKVCache, k: jax.Array | QuantArray, v: jax.Array | QuantArray, *, layer_idx: int):
-    key_heads = cache.k[layer_idx].shape[0]
-    assert v.shape[:-1] == k.shape[:-1] == (cache.batch_size, key_heads, 1)
+def _paged_update_slice(cache: PagedKVCache, kv: tuple[jax.Array | QuantArray, ...], *, layer_idx: int):
+    #key_heads = cache.buffers[0][layer_idx].shape[0]
+    #assert v.shape[:-1] == k.shape[:-1] == (cache.batch_size, key_heads, 1)  # TODO write this generically
     needs_next_page = (cache.lengths % cache.page_size) == 0
     page_table_idx = cache.lengths // cache.page_size
     current_page_cursor = jnp.take_along_axis(cache.block_tables, page_table_idx[:, None], axis=-1)[..., 0]
-    avg_pages_per_batch_entry = round(cache.k[layer_idx].shape[0] / cache.batch_size)
+    avg_pages_per_batch_entry = round(cache.buffers[0][layer_idx].shape[0] / cache.batch_size)
     even_batch_spread = jnp.arange(cache.batch_size) * avg_pages_per_batch_entry
     proposal_pages = jnp.where(cache.lengths == 0, even_batch_spread, current_page_cursor + 1)
     free_pages = _find_empty_pages(cache.free_pages, cache.batch_size, proposal_pages=proposal_pages)
@@ -127,27 +136,28 @@ def _paged_update_slice(cache: PagedKVCache, k: jax.Array | QuantArray, v: jax.A
     # for batch index update the target slice is (heads, i, j, head_dim)
     # so transpose update (batch, heads, seq, head_dim) -> (batch, heads, head_dim) -> (heads, batch, head_dim)
     _update = lambda dest, src: dest.at[:, page_cursor, inpage_cursor, ...].set(src.squeeze(2).swapaxes(0, 1))
-    cache.k[layer_idx], cache.v[layer_idx] = jax.tree.map(_update, (cache.k[layer_idx], cache.v[layer_idx]), (k, v))
+    for buffer, new_buffer in safe_zip(cache.buffers, kv):
+        buffer[layer_idx] = jax.tree.map(_update, buffer[layer_idx], new_buffer)
 
     batch_idx = jnp.arange(cache.batch_size)
     new_block_tables = cache.block_tables.at[batch_idx, new_lengths // cache.page_size].set(page_cursor)
 
     new_free_pages = cache.free_pages.at[page_cursor].set(False, mode="drop")
     new_state = dict(lengths=new_lengths, block_tables=new_block_tables, free_pages=new_free_pages)
-    return cache.k[layer_idx], cache.v[layer_idx], new_state
+    return tuple(buffer[layer_idx] for buffer in cache.buffers), new_state
 
 
-def paged_update_slice(cache: PagedKVCache, k: jax.Array | QuantArray, v: jax.Array | QuantArray, *, layer_idx: int):
+def paged_update_slice(cache: PagedKVCache, kv: tuple[jax.Array | QuantArray, ...], *, layer_idx: int):
     repl_sharding = jax.typeof(cache.lengths).sharding
-    kv_sharding = jax.tree.map(lambda x: jax.typeof(x).sharding, (cache.k[layer_idx], cache.v[layer_idx]))
-    sharding = (*kv_sharding, dict(lengths=repl_sharding, block_tables=repl_sharding, free_pages=repl_sharding))
-    return auto_axes(partial(_paged_update_slice, layer_idx=layer_idx), out_sharding=sharding)(cache, k, v)
+    kv_sharding = jax.tree.map(lambda x: jax.typeof(x).sharding, tuple(buffer[layer_idx] for buffer in cache.buffers))
+    sharding = (kv_sharding, dict(lengths=repl_sharding, block_tables=repl_sharding, free_pages=repl_sharding))
+    return auto_axes(partial(_paged_update_slice, layer_idx=layer_idx), out_sharding=sharding)(cache, kv)
 
 
 @partial(jax.jit, donate_argnames=("cache",))
 def _batch_paged_update_sequences(
     cache: PagedKVCache,
-    kvs: list[tuple[list[jax.Array | QuantArray], list[jax.Array | QuantArray]]],
+    kvs: list[tuple[jax.Array | QuantArray, ...]],
     batch_idxs: list[jax.Array],
     actual_lens: list[jax.Array],
     update_mask: list[bool] | None = None,
@@ -156,9 +166,7 @@ def _batch_paged_update_sequences(
     batch_idxs = jnp.where(update_mask, jnp.array(batch_idxs), 2**30)  # send masked to nowhere
     actual_lens = jnp.minimum(jnp.array(actual_lens), jnp.array([jax.tree.leaves(kv)[0].shape[2] for kv in kvs]))
 
-    kvs, max_seq_len = _transpose_attention_tree(
-        kvs, time_axis=2
-    )  # undo stacking along the layer dimension for transit
+    kvs, max_seq_len = _transpose_attention_tree(kvs, time_axis=2)  # undo stack along layer dimension in transit
 
     # clear existing pages
     actual_page_num = jnp.rint(jnp.ceil(cache.lengths[batch_idxs] / cache.page_size)).astype(jnp.int32)
@@ -186,21 +194,23 @@ def _batch_paged_update_sequences(
         update_permute = [1, 0, 2] + [i for i in range(u.ndim) if i not in (0, 1, 2)]
         return x.at[:, pages_idx, ...].set(u.transpose(update_permute), mode="drop")
 
-    cache_k, cache_v = jax.tree.map(_update_element, (cache.k, cache.v), kvs)
+    new_buffers = jax.tree.map(_update_element, cache.buffers, kvs)
     block_tables_idx = jnp.where(
         update_mask[:, None] & (pages_arange[None, :] < actual_page_num[:, None]), pages_arange[None, :], 2**30
     )
     new_block_tables = cache.block_tables.at[batch_idxs[:, None], block_tables_idx].set(pages_idx, mode="drop")
     new_free_pages = new_free_pages.at[pages_idx.reshape(-1)].set(False, mode="drop")
     new_lengths = cache.lengths.at[batch_idxs].set(actual_lens, mode="drop")
+
+    named_buffers = dict(zip([field.name for field in dataclasses.fields(cache)][:len(new_buffers)], new_buffers))
     return dataclasses.replace(
-        cache, k=cache_k, v=cache_v, lengths=new_lengths, block_tables=new_block_tables, free_pages=new_free_pages
+        cache, **named_buffers, lengths=new_lengths, block_tables=new_block_tables, free_pages=new_free_pages
     )
 
 
 def batch_paged_update_sequences(
     cache: KVCache,
-    kvs: list[tuple[list[jax.Array | QuantArray], list[jax.Array | QuantArray]]],
+    kvs: list[tuple[jax.Array | QuantArray, ...]],
     batch_idxs: list[jax.Array],
     actual_lens: list[jax.Array],
 ):
@@ -222,5 +232,5 @@ def batch_paged_get_entry(cache: PagedKVCache, batch_idx: jax.Array, max_seq_len
     _get = lambda x: jnp.where(mask[None, :, *([None] * (x.ndim - 3))], _reshape_out(x[:, page_indices, ...]), 0)
 
     # stack along layer dimensions for transit
-    kvs = tuple(jax.tree.map(lambda *xs: jnp.stack(xs, 0), *z) for z in jax.tree.map(_get, (cache.k, cache.v)))
+    kvs = tuple(jax.tree.map(lambda *xs: jnp.stack(xs, 0), *z) for z in jax.tree.map(_get, cache.buffers))
     return kvs, true_len

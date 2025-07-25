@@ -37,6 +37,7 @@ try:
 except ModuleNotFoundError:
     from jax.sharding import auto_axes as _auto_axes, reshard
 from jax.experimental.pallas.ops.gpu import paged_attention
+from etils import epath
 
 from . import ragged_attention
 from . import attention_cache_utils
@@ -216,7 +217,7 @@ is_param = lambda x: is_type(x, ArrayInfo)
 _count_left_padding = lambda ids, pad_id=0: auto_axes(
     lambda ids: jnp.sum(jnp.cumsum(ids != pad_id, axis=-1) == 0, axis=-1), out_sharding=P(None)
 )(ids)
-_length_minus_padding = lambda segment_ids: auto_axes(
+_length_minus_right_padding = lambda segment_ids: auto_axes(
     lambda segment_ids: jnp.sum(jnp.cumsum(jnp.flip(segment_ids != 0, -1), axis=-1) > 0, -1), out_sharding=P(None)
 )(segment_ids)
 
@@ -411,7 +412,7 @@ class KVCache(_Init):
     iter: jax.Array  # []  # sequences are right-aligned for slice update performance
     starts: jax.Array  # [batch_size]  # sequences are right-aligned, we need start indices
     batch_size: int = 0
-    size: int = 0
+    size: int = 2 ** 30
     time_axis: int = 2
 
     @classmethod
@@ -428,6 +429,7 @@ class KVCache(_Init):
             # -1 means unintialized since iter (cursor) must be 0 <= iter < len - 1
             iter=ArrayInfo((), jnp.int32, (), jax.nn.initializers.constant(-1)),
             starts=ArrayInfo((batch_size,), jnp.int32, ("batch",), jax.nn.initializers.zeros),
+            size=cfg.max_seq_len,
         )
         if cfg.quant_cache:
             _quantize = partial(quantize, axis=-1, scale_dtype=cfg.quant_scale_dtype, zero_init=True)
@@ -447,8 +449,11 @@ class KVCache(_Init):
         return cache
 
     def fill_len(self) -> jax.Array:
-        length = jnp.where(self.iter > self.starts, self.iter - self.starts, self.size + self.iter - self.starts)
-        return jnp.where(self.iter >= 0, length, 0)
+        return jnp.where(self.iter >= 0, (self.iter - self.starts) % self.size, 0)
+
+    @property
+    def buffers(self) -> tuple[jax.Array, ...]:
+        return (self.k, self.v)
 
     update_slice = None
     insert_sequences = staticmethod(attention_cache_utils.kvcache_update_cache)
@@ -463,7 +468,7 @@ class PagedKVCache(_Init):
     block_tables: jax.Array  # [batch_size, pages_per_seq]
     free_pages: jax.Array  # [total_num_pages]
     batch_size: int = 0
-    size: int = 2**31 - 1
+    size: int = 2**30
     page_size: int = 0
 
     @classmethod
@@ -500,6 +505,10 @@ class PagedKVCache(_Init):
 
     def fill_len(self) -> jax.Array:
         return self.lengths
+
+    @property
+    def buffers(self) -> tuple[jax.Array, ...]:
+        return (self.k, self.v)
 
     update_slice = staticmethod(attention_cache_utils.paged_update_slice)
     insert_sequences = staticmethod(attention_cache_utils.batch_paged_update_sequences)
@@ -807,12 +816,9 @@ def attention_block(
         q, k = apply_rotary_embedding(q, sin, cos), apply_rotary_embedding(k, sin, cos)
 
     if cfg.quant_cache:
-        k = QuantArray(
-            *quantize(k, -1, scale_dtype=cfg.quant_scale_dtype), out_scaling=True, scale_expand_dims=(-2, -3)
-        )
-        v = QuantArray(
-            *quantize(v, -1, scale_dtype=cfg.quant_scale_dtype), out_scaling=False, scale_expand_dims=(-2, -3)
-        )
+        _quantize = partial(quantize, axis=-1, scale_dtype=cfg.quant_scale_dtype)
+        k = QuantArray(*_quantize(k), out_scaling=True, scale_expand_dims=(-2, -3))
+        v = QuantArray(*_quantize(v), out_scaling=False, scale_expand_dims=(-2, -3))
 
     with jax.named_scope("cache_update"):
         paged_state, starts = None, None
@@ -825,23 +831,21 @@ def attention_block(
             ) % cache.size  # [B, T]
 
             q_segment_ids = jnp.where(segment_ids != 0, 1, 0)
-            incremental_position = jnp.max(_length_minus_padding(segment_ids))
+            incremental_position = jnp.max(_length_minus_right_padding(segment_ids))
             # i.e. valid below where we've written things [B, T]
-            kv_segment_ids = (
-                (time_indices >= 0) & (time_indices < cache.fill_len()[:, None] + incremental_position)
-            ).astype(jnp.int32)
-            q_offset = cache.fill_len() - _count_left_padding(segment_ids)
+            kv_segment_ids = (time_indices >= 0) & (time_indices < cache.fill_len()[:, None] + incremental_position)
+            q_offset = cache.fill_len() - _count_left_padding(segment_ids, 0)  # 0 is the pad "token" for segment_ids
             starts, lengths = cache.starts, cache.fill_len()
             cache_updates = (k, v)
         elif is_type(cache, PagedKVCache):
             cache: PagedKVCache
-            k, v, paged_state = PagedKVCache.update_slice(cache, k=k, v=v, layer_idx=idx)
+            (k, v), paged_state = PagedKVCache.update_slice(cache, (k, v), layer_idx=idx)
             cache_updates = (k, v, paged_state)
         else:
             # this supports prefill only; no support for a ring cache buffer here
             q_segment_ids, kv_segment_ids = segment_ids, segment_ids
             q_offset = jnp.zeros(x.shape[0], dtype=jnp.int32)
-            starts, lengths = _count_left_padding(segment_ids, 0), _length_minus_padding(kv_segment_ids)
+            starts, lengths = _count_left_padding(segment_ids, 0), _length_minus_right_padding(kv_segment_ids)
             cache_updates = (k, v)
 
     # Compute attention
@@ -931,15 +935,12 @@ def forward(
         x, cache_updates = forward_layer(x, segment_ids, layer, sin, cos, idx, cfg, cache)
         all_cache_updates.append(cache_updates)
 
-    # Final layer norm.
-    x = rms_norm(x, weights.gamma_final)
-
-    # Project to vocabulary size
-    logits = einsum("btd,dv->btv", x, weights.lm_head)
+    x = rms_norm(x, weights.gamma_final)  # Final layer norm.
+    logits = einsum("btd,dv->btv", x, weights.lm_head)  # Project to vocabulary size
 
     if is_type(cache, KVCache):
         cache.k, cache.v = [z[0] for z in all_cache_updates], [z[1] for z in all_cache_updates]
-        new_iter = (jnp.maximum(0, cache.iter) + jnp.max(_length_minus_padding(segment_ids))) % cache.size
+        new_iter = (jnp.maximum(0, cache.iter) + jnp.max(_length_minus_right_padding(segment_ids))) % cache.size
         cache = dataclasses.replace(cache, iter=new_iter)
         return logits, cache
     elif is_type(cache, PagedKVCache):
