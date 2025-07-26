@@ -81,7 +81,7 @@ Responses:
 | TPU     | batch size | context length | tok/s    | HBM BW util $^*$ | comments        |
 | :------ | ---------: | -------------: | -------: | ---------------: | :-------------- |
 
-TOOD
+TODO
 
 Results generated using jax 0.5.3, Python 3.10.15. Cost computation based on
 https://cloud.google.com/spot-vms/pricing, region `us-central1` as of Feb 28
