@@ -327,7 +327,8 @@ def quantize(x: jax.Array | ArrayInfo, axis: int | tuple[int, ...], scale_dtype=
 def quantize_update_slice(x: QuantArray, y: jax.Array, pos: int, update_axis: int, quant_axis: int):
     assert x.quant.ndim == y.ndim
     quant_axis, update_axis = quant_axis % x.quant.ndim, update_axis % x.quant.ndim  # normalize axis numbers
-    y_quant, y_scale = quantize(y, axis=quant_axis, scale_dtype=x.scale.dtype)  # quantize rhs
+    #y_quant, y_scale = quantize(y, axis=quant_axis, scale_dtype=x.scale.dtype)  # quantize rhs
+    y_quant, y_scale = y.quant, y.scale
     scale_update_axis = [ax for ax in range(x.quant.ndim) if ax != quant_axis][update_axis]  # update axis in `scale`
     z_quant = jax.lax.dynamic_update_slice_in_dim(x.quant, y_quant.astype(x.quant.dtype), pos, axis=update_axis)
     z_scale = jax.lax.dynamic_update_slice_in_dim(x.scale, y_scale.astype(x.scale.dtype), pos, axis=scale_update_axis)
@@ -587,9 +588,9 @@ class KVCache(_Init):
             _init,
         )
         k_pe_info = ArrayInfo(
-            (batch_size, max_seq_len, cfg.qk_rope_head_dim),
+            (batch_size, 1, max_seq_len, cfg.qk_rope_head_dim),
             dtype,
-            ("batch", "sequence", "head_dim"),
+            ("batch", None, "sequence", "head_dim"),
             _init,
         )
         v_info = ArrayInfo(
@@ -613,7 +614,7 @@ class KVCache(_Init):
                 for k_nope in cache.k_nope
             ]
             cache.k_pe = [
-                QuantArray(*_quantize(k_pe), out_scaling=True, scale_expand_dims=(-2, -3))
+                QuantArray(*_quantize(k_pe), out_scaling=True, scale_expand_dims=-2)
                 for k_pe in cache.k_pe
             ]
             cache.v = [
@@ -772,7 +773,8 @@ def attention(
     _, h, T, _ = k_nope.shape
 
     qk = einsum("bhtd,bhTd->bhtT", q_nope, k_nope)
-    qk = qk + einsum("bhtd,bTd->bhtT", q_pe, k_pe)
+    #qk = qk + einsum("bhtd,bTd->bhtT", q_pe, k_pe)
+    qk = qk + einsum("bhtd,b1Td->bhtT", q_pe, k_pe)
     qk = qk * scale  # [b, h, t, T]
 
     mask = make_attention_mask(t, T, q_segment_ids, kv_segment_ids, q_offset, kv_offset, cfg.causal)
@@ -871,18 +873,27 @@ def mla_attention_block(
     with jax.named_scope("kv_compressed_embed"):
         kv_compressed = einsum("btd,dr->btr", x, attn_layer.kv_a).astype(dtype)
         kv_compressed = rms_norm(kv_compressed, attn_layer.kv_gamma).astype(dtype)
-        k_pe = einsum("btd,dq->btq", x, attn_layer.k_pe)
-        k_pe = apply_rotary_embedding(k_pe[..., None, :, :], sin, cos)[..., 0, :, :].astype(dtype)
+        #k_pe = einsum("btd,dq->btq", x, attn_layer.k_pe)
+        #k_pe = apply_rotary_embedding(k_pe[..., None, :, :], sin, cos)[..., 0, :, :].astype(dtype)
+        k_pe = einsum("btd,dq->btq", x, attn_layer.k_pe)[..., None, :, :]
+        k_pe = apply_rotary_embedding(k_pe, sin, cos).astype(dtype)
 
     with jax.named_scope("kv_embed"):
         k_nope = einsum("btr,rhq->bhtq", kv_compressed, attn_layer.k_b)
         v = einsum("btr,rhv->bhtv", kv_compressed, attn_layer.v_b)
 
+    if cfg.quantize_cache:
+        _quantize = partial(quantize, axis=-1, scale_dtype=cfg.quant_scale_dtype)
+        k_nope = QuantArray(*_quantize(k_nope), out_scaling=True, scale_expand_dims=-2)
+        k_pe = QuantArray(*_quantize(k_pe), out_scaling=True, scale_expand_dims=-2)
+        v = QuantArray(*_quantize(v), out_scaling=False, scale_expand_dims=-2)
+
     with jax.named_scope("full_cache_update"):
         if is_type(cache, KVCache):
             it = jnp.maximum(cache.iter, 0)
             k_nope = update_slice(cache.k_nope[idx], k_nope, it, update_axis=cache.time_axis)
-            k_pe = update_slice(cache.k_pe[idx], k_pe, it, update_axis=cache.time_axis - 1)
+            #k_pe = update_slice(cache.k_pe[idx], k_pe, it, update_axis=cache.time_axis - 1)
+            k_pe = update_slice(cache.k_pe[idx], k_pe, it, update_axis=cache.time_axis)
             v = update_slice(cache.v[idx], v, it, update_axis=cache.time_axis)
             cache_updates = (k_nope, k_pe, v)
 
@@ -905,7 +916,8 @@ def mla_attention_block(
     lsc = partial(logical_sharding_constraint, mesh=cfg.mesh, rules=cfg.rules)
     spec = ("batch", "act_heads", "sequence", "head_dim")
     q_nope, q_pe = lsc(q_nope, spec), lsc(q_pe, spec)
-    k_nope, k_pe, v = lsc(k_nope, spec), lsc(k_pe, ("batch", "sequence", "head_dim")), lsc(v, spec)
+    #k_nope, k_pe, v = lsc(k_nope, spec), lsc(k_pe, ("batch", "sequence", "head_dim")), lsc(v, spec)
+    k_nope, k_pe, v = lsc(k_nope, spec), lsc(k_pe, ("batch", None, "sequence", "head_dim")), lsc(v, spec)
 
     # Compute attention
     with jax.named_scope("attention"):
@@ -1251,7 +1263,7 @@ def prefill(tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, pa
         uninitialized_iter = -jnp.ones_like(cache.iter)
         cache = dataclasses.replace(cache, starts=_count_left_padding(prompt, pad_id=pad_id), iter=uninitialized_iter)
     else:
-        cache_shardings = tuple([z[idx] for idx in range(cfg.num_layers)] for z in cache_shardings)
+        cache_shardings = [tuple(z[idx] for z in cache_shardings.buffers) for idx in range(cfg.num_layers)]
     logits_shardings = logical_to_sharding(("batch", "sequence", "act_embed"), cfg.mesh, cfg.rules)
     logits, cache = jax.jit(forward, donate_argnums=(4,), out_shardings=(logits_shardings, cache_shardings))(
         prompt, prompt_segment_ids, weights, cfg, cache

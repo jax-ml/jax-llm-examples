@@ -6,11 +6,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-try:
-    from jax.experimental.shard import auto_axes
-except ModuleNotFoundError:
-    from jax.sharding import auto_axes
-
 QuantArray, PyTree = Any, Any
 
 KVCache = Any
@@ -95,7 +90,7 @@ def kvcache_get_entry(cache: KVCache, batch_idx: jax.Array):
     shift = -cache.starts[batch_idx]
     assert cache.time_axis > 0
     kvs = jax.tree.map(lambda x: jnp.roll(x[batch_idx, ...], shift=shift, axis=cache.time_axis - 1), cache.buffers)
-    kvs = (jax.tree.map(lambda *xs: jnp.stack(xs, 0), kvs[0]), jax.tree.map(lambda *xs: jnp.stack(xs, 0), kvs[1]))
+    kvs = tuple(jax.tree.map(lambda *xs: jnp.stack(xs, 0), *z) for z in kvs)
     true_len = cache.fill_len()[batch_idx]
     return kvs, true_len
 
@@ -116,42 +111,6 @@ def _find_empty_pages(free_pages: jax.Array, k: int, proposal_pages: jax.Array |
         return jnp.where(proposal_mask, proposal_pages, jax.lax.top_k(newly_free_pages, k)[1][indicies])
     else:
         return jax.lax.top_k(free_pages, k)[1]
-
-
-def _paged_update_slice(cache: PagedKVCache, kv: tuple[jax.Array | QuantArray, ...], *, layer_idx: int):
-    #key_heads = cache.buffers[0][layer_idx].shape[0]
-    #assert v.shape[:-1] == k.shape[:-1] == (cache.batch_size, key_heads, 1)  # TODO write this generically
-    needs_next_page = (cache.lengths % cache.page_size) == 0
-    page_table_idx = cache.lengths // cache.page_size
-    current_page_cursor = jnp.take_along_axis(cache.block_tables, page_table_idx[:, None], axis=-1)[..., 0]
-    avg_pages_per_batch_entry = round(cache.buffers[0][layer_idx].shape[0] / cache.batch_size)
-    even_batch_spread = jnp.arange(cache.batch_size) * avg_pages_per_batch_entry
-    proposal_pages = jnp.where(cache.lengths == 0, even_batch_spread, current_page_cursor + 1)
-    free_pages = _find_empty_pages(cache.free_pages, cache.batch_size, proposal_pages=proposal_pages)
-    page_cursor = jnp.where(needs_next_page, free_pages, current_page_cursor)
-
-    inpage_cursor = cache.lengths % cache.page_size
-
-    new_lengths = cache.lengths + 1
-    # for batch index update the target slice is (heads, i, j, head_dim)
-    # so transpose update (batch, heads, seq, head_dim) -> (batch, heads, head_dim) -> (heads, batch, head_dim)
-    _update = lambda dest, src: dest.at[:, page_cursor, inpage_cursor, ...].set(src.squeeze(2).swapaxes(0, 1))
-    for buffer, new_buffer in safe_zip(cache.buffers, kv):
-        buffer[layer_idx] = jax.tree.map(_update, buffer[layer_idx], new_buffer)
-
-    batch_idx = jnp.arange(cache.batch_size)
-    new_block_tables = cache.block_tables.at[batch_idx, new_lengths // cache.page_size].set(page_cursor)
-
-    new_free_pages = cache.free_pages.at[page_cursor].set(False, mode="drop")
-    new_state = dict(lengths=new_lengths, block_tables=new_block_tables, free_pages=new_free_pages)
-    return tuple(buffer[layer_idx] for buffer in cache.buffers), new_state
-
-
-def paged_update_slice(cache: PagedKVCache, kv: tuple[jax.Array | QuantArray, ...], *, layer_idx: int):
-    repl_sharding = jax.typeof(cache.lengths).sharding
-    kv_sharding = jax.tree.map(lambda x: jax.typeof(x).sharding, tuple(buffer[layer_idx] for buffer in cache.buffers))
-    sharding = (kv_sharding, dict(lengths=repl_sharding, block_tables=repl_sharding, free_pages=repl_sharding))
-    return auto_axes(partial(_paged_update_slice, layer_idx=layer_idx), out_sharding=sharding)(cache, kv)
 
 
 @partial(jax.jit, donate_argnames=("cache",))

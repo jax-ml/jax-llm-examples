@@ -397,7 +397,7 @@ class SyncServer:
     """A regular local network server for syncing between JAX processes in the multi-process JAX setup."""
 
     CLIENT = None
-    TIMEOUT_SEC = 60
+    TIMEOUT_SEC = 600
 
     @staticmethod
     def _get_client():
@@ -464,6 +464,7 @@ class ServingLoop:
         decode_fn: Callable,
         decode_weights: Weights,
         decode_cache: KVCache,
+        is_server: bool = False,
     ):
         self.serve_cfg, self.cfg = serve_cfg, cfg
 
@@ -503,6 +504,7 @@ class ServingLoop:
 
         # setup misc
         self.pending_requests, self.requests_lock, self.results = [], threading.Lock(), {}
+        self.params_lock = threading.Lock()
         self.pad_id, self.eos_tokens, self.time_axis = 0, np.array(serve_cfg.eos_tokens), TIME_AXIS
         self._background = ThreadPoolExecutor(max_workers=1024)
 
@@ -515,7 +517,7 @@ class ServingLoop:
         self.new_prefix_cache()
 
         # setup the sync server for multi-host
-        self._it, self.roles = 0, (("server",) if jax.process_index() == 0 else ())  # main server
+        self._it, self.roles = 0, (("server",) if is_server else ())  # main server
         if any(d.id in [d_.id for d_ in self.decode_mesh.devices.reshape(-1)] for d in jax.local_devices()):
             self.roles += ("decode",)  # any node which has decode mesh devices
         if any(d.id in [d_.id for d_ in self.prefill_mesh.devices.reshape(-1)] for d in jax.local_devices()):
@@ -586,14 +588,21 @@ class ServingLoop:
                     d or getattr(result, "tokens_decoded", 0) >= self.serve_cfg.max_decode_length
                     for d, result in zip(done, self.decode_work.active_results)
                 ]
+                output_tokens_flat = output_tokens.reshape(-1).tolist()
+                output_mapping_flat = output_mapping.reshape(-1).tolist()
             else:
-                output_tokens, done = None, None
-            done = SyncServer.broadcast("done_sync", self._it, done, is_source="decode_coordinator" in self.roles)
-            if "server" in self.roles:
-                for token, id in zip(output_tokens.reshape(-1).tolist(), output_mapping.reshape(-1).tolist()):
-                    if id > 0:
-                        self.results[id].token_list.append(token)
-                        self.results[id].tokens_decoded += 1
+                output_tokens, done, output_tokens_flat, output_mapping_flat = None, None, None, None
+            output_tokens_flat, output_mapping_flat, done = SyncServer.broadcast(
+                "decode_output",
+                self._it,
+                (output_tokens_flat, output_mapping_flat, done),
+                is_source="decode_coordinator" in self.roles,
+            )
+            #if "server" in self.roles or "decode_coordinator" in self.roles:
+            for token, id in zip(output_tokens.reshape(-1).tolist(), output_mapping.reshape(-1).tolist()):
+                if id > 0:
+                    self.results[id].token_list.append(token)
+                    self.results[id].tokens_decoded += 1
             with use_mesh(self.decode_mesh):
                 for i, result in enumerate(self.decode_work.active_results):
                     if result is None:
@@ -604,7 +613,8 @@ class ServingLoop:
                             sequence = np.array(result.token_list)
                             with use_mesh(self.decode_mesh):
                                 cache_entry, _ = self._get_cache_entry(self.decode_work.cache, i)
-                            self._background.submit(self._insert_prefix, sequence, cache_entry, mesh=self.decode_mesh)
+                            # self._background.submit(self._insert_prefix, sequence, cache_entry, mesh=self.decode_mesh)
+                            self._insert_prefix(sequence, cache_entry, mesh=self.decode_mesh)
                         return_request(result)
                         result.done, self.decode_work.active_results[i] = True, None
 
@@ -624,8 +634,11 @@ class ServingLoop:
 
         # 2. triage requests queue into cached (-> decode) and not-cached work (-> prefill)
         new_pending_retrievals = []
-        for request, cache_entry_fut in self.prefill_work.pending_cache_retrievals:
-            if len(self.prefill_work.to_decode) < self.serve_cfg.decode_batch_size and cache_entry_fut.done():
+        done_mask = [cache_entry_fut.done() for (_, cache_entry_fut) in self.prefill_work.pending_cache_retrievals]
+        done_mask = SyncServer.broadcast("retrievals_done", self._it, done_mask, is_source="prefill_coordinator" in self.roles)
+        for i, (request, cache_entry_fut) in enumerate(self.prefill_work.pending_cache_retrievals):
+            #if len(self.prefill_work.to_decode) < self.serve_cfg.decode_batch_size and cache_entry_fut.done():
+            if len(self.prefill_work.to_decode) < self.serve_cfg.decode_batch_size and done_mask[i]:
                 with use_mesh(self.decode_mesh):
                     # batch missing (-1) layers concatenated (+1)
                     cache_entry = partial(_concat, cache_entry_fut.result(), self.time_axis - 1 + 1)  # jit work future
@@ -641,6 +654,7 @@ class ServingLoop:
         retrieval_results = self._background.map(
             lambda request: (self._retrieve_prefix(np.array(request.text[:-1])), request), self.prefill_work.requests
         )
+        #retrieval_results = [[(None, -100), request] for request in self.prefill_work.requests]
         for (cache_entry_fut, length), request in retrieval_results:
             if length == len(request.text) - 1:
                 self.prefill_work.pending_cache_retrievals.append((request, cache_entry_fut))
@@ -702,7 +716,11 @@ class ServingLoop:
         if "server" in self.roles:
             with self.requests_lock:
                 self.pending_requests, requests = [], list(self.pending_requests)
-        requests = SyncServer.broadcast("requests", self._it, requests, is_source="server" in self.roles)
+        with self.params_lock:
+            serve_cfg, requests = SyncServer.broadcast(
+                "requests", self._it, (dataclasses.asdict(self.serve_cfg), requests), is_source="server" in self.roles
+            )
+            self.serve_cfg = dataclasses.replace(self.serve_cfg, **serve_cfg)
         for request in requests:
             self.total_requests += 1
             self.prefill_work.requests.append(UserRequestPrompt(**request))
@@ -722,6 +740,10 @@ class ServingLoop:
     def add_request(self, request: UserRequestPrompt):
         with self.requests_lock:
             self.pending_requests.append(dataclasses.asdict(request))
+
+    def update_params(self, params: dict[str, Any]):
+        with self.params_lock:
+            self.serve_cfg = dataclasses.replace(self.serve_cfg, **params)
 
     def new_prefix_cache(self):
         self.prefix_cache = TrieNode(TrieNode.new_id(), None, None, lock=threading.Lock())
