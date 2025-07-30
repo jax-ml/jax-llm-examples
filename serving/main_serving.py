@@ -9,29 +9,30 @@ import time
 from typing import AsyncGenerator
 from contextlib import asynccontextmanager
 import os
+from argparse import ArgumentParser
 
 import jax
 from jax import random
 from jax.sharding import PartitionSpec as P, AxisType, NamedSharding
-from llama3_jax import model as l3jax
-import serving_jax as serving
 import numpy as np
-
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import uvicorn
 
+from llama3_jax import model as l3jax
+import serving_jax as serving
+from serving_jax import attention_cache_utils
 
-TOKENIZER, SERVE_LOOP, SERVING_THREAD = None, None, None
+
+TOKENIZER, SERVE_LOOP, SERVING_THREAD, ARGS = None, None, None, None
 
 jax.config.update("jax_explain_cache_misses", True)
 jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
 jax.config.update("jax_enable_empty_arrays", True)
 
 try:  # newer JAX only
+    assert False
     my_id = int(socket.gethostname().split("-")[-1]) - 1
     my_ip = socket.getaddrinfo(socket.gethostname(), 80)[0][-1][0]
     jax.config.update("jax_cross_host_transfer_socket_address", f"{my_ip}:{17007 + my_id}")
@@ -40,7 +41,6 @@ except: # noqa: E722
     pass
 
 shutdown_signal = threading.Event()
-
 
 def encode_input(tokenizer, texts, pad_id: int = 0):
     assert isinstance(texts, list)
@@ -51,18 +51,13 @@ def encode_input(tokenizer, texts, pad_id: int = 0):
     return np.array([(max_len - len(x)) * [pad_id] + x for x in inputs])
 
 
-def _place_local(tree, sharding: NamedSharding, present: bool):
-    return jax.tree.map(
-        lambda z, s: jax.make_array_from_single_device_arrays(
-            z.shape, s, [] if not present else [y.data for y in z.addressable_shards], dtype=z.dtype
-        ),
-        tree,
-        sharding,
-    )
-
-
 def load_model():
-    global SERVE_LOOP, SERVING_THREAD, TOKENIZER
+    global SERVE_LOOP, SERVING_THREAD, TOKENIZER, ARGS
+
+    parser = ArgumentParser()
+    parser.add_argument("--server", action="store_true", help="Make this node the main server.", default=False)
+    ARGS = parser.parse_args()
+
     #process_idx = int(socket.gethostname().split("-")[-1]) - 1  # a scheme where hosts are (host-1, host-2, ...)
     #jax.distributed.initialize(os.environ["COORDINATOR_ADDRESS"], 2, process_idx)
     print(jax.devices())
@@ -79,42 +74,25 @@ def load_model():
     # two hosts, different device and host meshes
     local_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.local_devices(), axis_types=(AxisType.Explicit,) * 3)
     decode_mesh, prefill_mesh = local_mesh, local_mesh
-    #decode_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[:8], axis_types=(AxisType.Explicit,) * 3)
-    #prefill_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[8:], axis_types=(AxisType.Explicit,) * 3)
-
-    # single host, same decode and prefill meshes
-    #local_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.local_devices(), axis_types=(AxisType.Explicit,) * 3)
-    #decode_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[:8], axis_types=(AxisType.Explicit,) * 3)
-    #prefill_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[:8], axis_types=(AxisType.Explicit,) * 3)
-
-    # single host, separate decode and prefill meshes
-    #local_mesh = jax.make_mesh((1, 4, 1), P("x", "y", "z"), devices=jax.local_devices()[:4], axis_types=(AxisType.Explicit,) * 3)
-    #decode_mesh = jax.make_mesh((1, 4, 1), P("x", "y", "z"), devices=jax.devices()[:4], axis_types=(AxisType.Explicit,) * 3)
-    #prefill_mesh = jax.make_mesh((1, 4, 1), P("x", "y", "z"), devices=jax.devices()[4:], axis_types=(AxisType.Explicit,) * 3)
-
     cfg = dataclasses.replace(cfg, mesh=decode_mesh, quant_layer=True, quant_cache=True)
     cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=False, use_decode_attn_kernel=False, max_seq_len=8192)
     cfg = dataclasses.replace(cfg, quant_layer=False, quant_cache=False)
     cfg.quant_cache = True
 
-    weights = l3jax.load_pytree(ckpt_path, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=local_mesh)))
-
-    # multi-host: until orbax update
-    decode_weights, prefill_weights = weights, weights
-    #decode_weights = _place_local(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=decode_mesh)), present=jax.process_index() == 0)
-    #prefill_weights = _place_local(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=prefill_mesh)), present=jax.process_index() == 1)
-
-    # single-host: until orbax update
-    #decode_weights = serving.device_put(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=decode_mesh)))
-    #prefill_weights = serving.device_put(weights, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=prefill_mesh)))
+    decode_weights = l3jax.load_pytree(ckpt_path, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=decode_mesh)))
+    prefill_weights = l3jax.load_pytree(ckpt_path, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=prefill_mesh)))
 
     print("---> Weights loaded")
 
     serve_cfg = serving.ServingConfig(decode_steps=32, max_decode_length=64)
     #decode_cache = l3jax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size)
+    #decode_cache.get_sequence = attention_cache_utils.kvcache_get_entry
+    #decode_cache.insert_sequences = attention_cache_utils.kvcache_update_cache
     decode_cache = l3jax.PagedKVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, 2048, 32)
+    decode_cache.get_sequence = attention_cache_utils.batch_paged_get_entry
+    decode_cache.insert_sequences = attention_cache_utils.batch_paged_update_sequences
     SERVE_LOOP = serving.ServingLoop(
-        serve_cfg, cfg, l3jax.prefill, prefill_weights, l3jax.decode_step, decode_weights, decode_cache
+        serve_cfg, cfg, l3jax.prefill, prefill_weights, l3jax.decode_step, decode_weights, decode_cache, ARGS.server
     )
     print("---> Created the serving loop")
 
@@ -122,6 +100,9 @@ def load_model():
         try:
             while not shutdown_signal.is_set():
                 SERVE_LOOP.serving_step()
+        except:  # noqa: E722
+            import traceback
+            print(traceback.format_exc(), flush=True)
         finally:
             print("Received a shutdown signal")
             time.sleep(0.1)
@@ -217,7 +198,7 @@ async def root():
 
 
 if __name__ == "__main__":
-    if jax.process_index() == 0:
+    if ARGS.server:
         uvicorn.run(APP, host="0.0.0.0", port=8081, reload=False, server_header=False)
     else:
         try:

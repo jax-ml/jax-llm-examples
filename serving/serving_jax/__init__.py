@@ -43,6 +43,7 @@ PyTree, PyTreeStruct = Any, Any
 
 TIME_AXIS = 2
 USE_PREFIX_CACHE = True  # the eviction mechanism is extremely simple right now
+#USE_PREFIX_CACHE = False
 is_type = lambda x, cls: (type(x).__name__ == cls.__name__) and (type(x).__module__ == cls.__module__)
 
 ########################################################################################################################
@@ -94,91 +95,11 @@ def _ensure_all_args_on_mesh(*args, mesh: Mesh):
 
 
 ########################################################################################################################
-# trie utils ###########################################################################################################
+# kv cache buffer management ###########################################################################################
 ########################################################################################################################
-
-_GLOBAL_NODE_ID = 0
-
-
-@dataclasses.dataclass
-class OffloadedValue:
-    ref: str | np.ndarray
-    spec: Any
-    shape_dtypes: Any
-
-
-@dataclasses.dataclass
-class TrieNode:
-    id: int
-    key: jax.Array
-    value: PyTree | OffloadedValue
-    children: list["TrieNode"] = dataclasses.field(default_factory=list)
-    child_keys: jax.Array | None = None
-    lock: "threading.Lock | None" = None
-    usage: int = 1
-
-    def __repr__(self, indent: int = 0):
-        lines = ["  " * indent + "TrieNode("]
-        lines.append(("  " * indent) + f"  key={str(self.key.tolist() if hasattr(self.key, 'tolist') else self.key)},")
-        lines.append(("  " * indent) + f"  usage={self.usage},")
-        if is_type(self.value, OffloadedValue):
-            lines.append(("  " * indent) + f"  value={self.value.ref},")
-        else:
-            lines.append(
-                ("  " * indent)
-                + f"  value={jax.tree.map(jax.typeof, self.value) if self.value is not None else 'None'},"
-            )
-        lines.append(
-            ("  " * indent) + f"  child_keys={jax.typeof(self.child_keys) if self.child_keys is not None else 'None'},"
-        )
-        lines.append(("  " * indent) + "  children=[")
-        if self.children:
-            for child in self.children:
-                lines.append(f"{child.__repr__(indent + 2)},")
-            lines.append("  " * indent + "  ],")
-        else:
-            lines[-1] += "],"
-        lines.append("  " * indent + ")")
-        return "\n".join(lines)
-
-    @staticmethod
-    def new_id():
-        global _GLOBAL_NODE_ID
-        _GLOBAL_NODE_ID += 1
-        return _GLOBAL_NODE_ID - 1
-
-    @staticmethod
-    def _dist_to_key(key, keys, mask, pad_idx: int):
-        invalid_rows = np.all(keys == pad_idx, axis=-1)
-        return np.where(invalid_rows, 2**30, np.sum(mask * np.abs(key - keys), axis=-1))
-
-    @staticmethod
-    def _append_key(keys, new_key, keys_len: int, pad_idx: int):
-        if keys is None:
-            return new_key[None, ...]  # 2 ** 0 power of 2
-        if keys_len == keys.shape[0]:  # need to double the keys buffer
-            new_buf = np.pad(
-                new_key[None, ...], ((0, keys.shape[0] - 1), (0, 0)), mode="constant", constant_values=pad_idx
-            )
-            return np.concatenate([keys, new_buf], 0)
-        else:
-            keys[keys_len, ...] = new_key
-            return keys
-
-    @staticmethod
-    def _pad_to_multiple_of(sequence: jax.Array, chunk_size: int, pad_idx: int):
-        sequence_pad_len = math.ceil(sequence.size / chunk_size) * chunk_size
-        return np.pad(sequence, ((0, sequence_pad_len - sequence.shape[-1])), mode="constant", constant_values=pad_idx)
-
-    @staticmethod
-    def _overlap_dist(key1, key2, mask):
-        return np.sum(np.cumsum(np.logical_not(mask & (key1 == key2)), axis=-1) == 0, axis=-1)
-
 
 @partial(jax.jit, static_argnames=("axis", "chunk_size", "ns"))
 def _split(val: jax.Array | list[jax.Array], axis: int, chunk_size: int, ns: int) -> list[jax.Array]:
-    spec = jax.tree.map(lambda x: [x] * ns, like_spec(val))
-
     def _fn(val):
         axis_ = axis % val.ndim
         size = val.shape[axis_]
@@ -188,7 +109,10 @@ def _split(val: jax.Array | list[jax.Array], axis: int, chunk_size: int, ns: int
         index = [slice(None) if i != axis_ else slice(0, ns * chunk_size) for i in range(val.ndim)]
         return jnp.split(val[*index], ns, axis=axis_)[:ns]
 
-    return auto_axes(lambda vals: jax.tree.map(_fn, vals), out_sharding=spec)(val)
+    val_leaves, val_structure = jax.tree.flatten(val)
+    spec = [[x] * ns for x in like_spec(val_leaves)]
+    split_leaves = auto_axes(lambda vals: [_fn(val) for val in vals], out_sharding=spec)(val_leaves)
+    return [jax.tree.unflatten(val_structure, [x[i] for x in split_leaves]) for i in range(ns)]
 
 
 @partial(jax.jit, static_argnames=("split_axis",))
@@ -197,134 +121,220 @@ def _concat(values, split_axis: int):
     return auto_axes(_fn, out_sharding=like_spec(values[0]))(values)
 
 
-def insert_prefix(
-    prefix_cache: TrieNode,
-    sequence: jax.Array,
-    value: PyTree,
-    *,
-    chunk_size: int,
-    split_axis: int,
-    pad_idx: int = 2**30,
-    executor: ThreadPoolExecutor | None = None,
-    mesh: Any | None = None,
+class KVBufferStore:
+    def __init__(self):
+        self.usecount, self.ondevice, self._store, self.unique_id, self.livecount = {}, {}, {}, 18, 0
+
+    def _get_unique_buffer_ids(self, n: int):
+        ids = list(range(self.unique_id, self.unique_id + n))
+        self.unique_id += n
+        return ids
+
+    def offload_buffers(self, how_many: int):
+        if how_many == 0:
+            return
+        candidates = sorted(self._store.keys(), key=lambda i: self.usecount[i] if self.ondevice[i] else 2 ** 60)
+        for i in candidates[:how_many]:
+            if self.ondevice[i]:
+                shrd = jax.tree.map(lambda x: x.sharding.with_memory_kind("pinned_host"), self._store[i])
+                self._store[i] = jax.device_put(self._store[i], shrd)
+                self.livecount -= 1
+
+    def load(self, id: int):
+        if isinstance(id, (tuple, list)):
+            return [self.load(i) for i in id]
+        if self.ondevice[id]:
+            return self._store[id]
+        self.ondevice[id] = True
+        self.livecount += 1
+        shrd = jax.tree.map(lambda x: x.sharding.with_memory_kind("device"), self._store[id])
+        self._store[id] = jax.device_put(self._store[id], shrd)
+        return self._store[id]
+
+    def delete(self, id: int):
+        if isinstance(id, (list, tuple)):
+            return [self.delete(i) for i in id]
+        self.livecount -= self.ondevice[id]
+        del self.usecount[id], self.ondevice[id], self._store[id]
+
+    def store(self, id: int, val: Any):
+        if isinstance(id, (tuple, list)):
+            return [self.store(i, v) for i, v in zip(id, val)]
+        self.livecount += 1
+        self.usecount[id], self.ondevice[id], self._store[id] = 1, True, val
+
+    def mark_visited(self, id: int):
+        if isinstance(id, (list, tuple)):
+            return [self.mark_visited(i) for i in id]
+        self.usecount[id] += 1
+
+BUFFER_STORE = KVBufferStore()
+
+########################################################################################################################
+# trie utils ###########################################################################################################
+########################################################################################################################
+
+EMPTY, HASH_BITWIDTH = -1, 1
+
+@dataclasses.dataclass
+class ChildKeys:
+    keys: np.ndarray
+    keys_hash: np.ndarray
+    keys_hash_mask: np.ndarray
+    key_lens: np.ndarray
+    num: int = 0
+
+
+def _hash_encode(v: np.ndarray, hash_bitwidth: int = HASH_BITWIDTH, pad_idx: int = EMPTY):
+    v, last_dim = v.astype(np.int64), min(64 // hash_bitwidth, v.shape[-1])
+    v_, el_mask = v.reshape(v.shape[:-1] + (-1, last_dim)), (1 << hash_bitwidth) - 1
+    mask = np.bitwise_or.reduce(((v_ != pad_idx) * el_mask) << (hash_bitwidth * np.arange(v_.shape[-1])), axis=-1)
+    h = np.bitwise_or.reduce((v_ & el_mask) << (hash_bitwidth * np.arange(v_.shape[-1])), axis=-1)
+    return h, mask
+
+
+def _prefilter_on_hash(
+    w: np.ndarray, keys: np.ndarray, vh: np.ndarray, vm: np.ndarray, hash_bitwidth: int = HASH_BITWIDTH, pad_idx: int = EMPTY
 ):
-    del executor
+    wh, wm = _hash_encode(w, hash_bitwidth=hash_bitwidth, pad_idx=pad_idx)
+    inv_match = (wh ^ vh) & vm & wm
+    # count full hash chunk matches, but don't miss sequences not matching at least one full hash
+    match_len = np.sum(np.cumsum(inv_match, axis=-1) == 0, axis=-1) + (w[0] == keys[:, 0])
+    max_match_len = max(np.max(match_len), 1)
+    return np.where(match_len == max_match_len)[0]
+
+def _fast_pad(x, size, axis, pad_val=0):
+    new_buf = pad_val * np.ones([size - s if i == axis else s for i, s in enumerate(x.shape)], dtype=x.dtype)
+    return np.concat([x, new_buf], axis)
+
+
+@dataclasses.dataclass
+class TrieNode:
+    value: int
+    children: list["TrieNode"] = dataclasses.field(default_factory=list)
+    child_keys: ChildKeys | None = None
+    lock: "threading.Lock | None" = None
+    usage: int = 1
+
+    def __repr__(self, indent: int = 0):
+        lines = [f"TrieNode(value={self.value}, usage={self.usage}, children={{"]
+        if len(self.children) == 0:
+            lines[-1] = lines[-1][:-1] + "})"
+        else:
+            for i, child in enumerate(self.children):
+                child_key = self.child_keys.keys[i, : self.child_keys.key_lens[i]].tolist()
+                lines.append(f"{' ' * indent}  {child_key}: {child.__repr__(indent + 2).strip()},")
+            lines.append(")")
+        return "\n".join([(" " * indent) + line for line in lines])
+
+    @staticmethod
+    def _overlap(child_keys: ChildKeys, key, key_len, pad_idx: int = EMPTY):
+        keys = child_keys.keys[: child_keys.num, :]
+        keys_hash = child_keys.keys_hash[: child_keys.num, :]
+        keys_hash_mask = child_keys.keys_hash_mask[: child_keys.num, :]
+
+        # pre-filter sequences
+        relevant_idx = _prefilter_on_hash(key, keys, keys_hash, keys_hash_mask, pad_idx=pad_idx)
+        if len(relevant_idx) == 0:
+            return np.zeros((child_keys.num,), dtype=np.int32), np.zeros((child_keys.num,), dtype=np.int32)
+        keys = keys[relevant_idx, :]
+
+        mask = np.cumsum((key == keys) | (key == pad_idx) | (keys == pad_idx), -1) == np.arange(1, key.shape[-1] + 1)
+        overlap = np.zeros((child_keys.num,), dtype=np.int32)
+        overlap[relevant_idx] = np.sum(mask, axis=-1)
+        return np.minimum(overlap, key_len), np.minimum(overlap, child_keys.key_lens[: child_keys.num])
+
+    @staticmethod
+    def _append_key(keys: ChildKeys | None, new_key: np.ndarray, key_len: int, pad_idx: int = EMPTY):
+        if keys is None:
+            key_hash, key_hash_mask = _hash_encode(new_key[None, :], pad_idx=pad_idx)
+            return ChildKeys(new_key[None, :], key_hash, key_hash_mask, np.array([key_len], dtype=np.int32), 1)
+        if keys.num == keys.keys.shape[0]:  # need to double the keys buffer
+            keys.keys = _fast_pad(keys.keys, 2 * keys.num, 0, 0)
+            keys.key_lens = _fast_pad(keys.key_lens, 2 * keys.num, 0)
+            keys.keys_hash = _fast_pad(keys.keys_hash, 2 * keys.num, 0, 0)
+            keys.keys_hash_mask = _fast_pad(keys.keys_hash_mask, 2 * keys.num, 0, 0)
+        keys.keys[keys.num, :], keys.key_lens[keys.num] = new_key, key_len
+        keys.keys_hash[keys.num, :], keys.keys_hash_mask[keys.num, :] = _hash_encode(new_key, pad_idx=pad_idx)
+        keys.num += 1
+        return keys
+
+    @staticmethod
+    def _pad_to_multiple_of(sequence: np.ndarray, chunk_size: int, pad_idx: int = EMPTY):
+        sequence_pad_len = math.ceil(sequence.size / chunk_size) * chunk_size
+        return _fast_pad(sequence, sequence_pad_len, 0, pad_idx)
+
+
+def insert_prefix(root: TrieNode, sequence: np.ndarray, ref_vals: list[int], *, chunk_size: int, pad_idx: int = 2**30):
+    if len(sequence) == 0:
+        return [], [], []
     sequence = np.array(sequence)
-    assert sequence.ndim == 1
-    sequence = TrieNode._pad_to_multiple_of(sequence, chunk_size, pad_idx=pad_idx)
-    ns = sequence.shape[-1] // chunk_size
-    sequence_chunks = np.split(sequence, ns)
-
-    # split the value, but only if it's needed for non-cache hit
-    value_chunks = None
-
-    def lazy_get_value(idx):
-        nonlocal value_chunks
-        if value_chunks is None:
-            value_leaves, value_struct = jax.tree.flatten(value)
-            with use_mesh(mesh):
-                split_leaves = _split(value_leaves, axis=split_axis, chunk_size=chunk_size, ns=ns)
-            value_chunks = [jax.tree.unflatten(value_struct, [x[i] for x in split_leaves]) for i in range(ns)]
-        return value_chunks[idx]
-
-    # walk the prefix cache tree
-    with prefix_cache.lock:
-        node = prefix_cache
-        for seq_idx, seq in enumerate(sequence_chunks):
-            if len(node.children) == 0:
-                node.child_keys = TrieNode._append_key(node.child_keys, seq, len(node.children), pad_idx=pad_idx)
-                node.children.append(TrieNode(TrieNode.new_id(), seq, lazy_get_value(seq_idx)))
-                node = node.children[-1]
-                continue
-            left_mask, right_mask = (seq != pad_idx), (node.child_keys != pad_idx)
-            left_dist = TrieNode._dist_to_key(seq, node.child_keys, left_mask, pad_idx=pad_idx)
-            right_dist = TrieNode._dist_to_key(seq, node.child_keys, right_mask, pad_idx=pad_idx)
-            left_idx, right_idx = np.argmin(left_dist), np.argmin(right_dist)
-            if node.children and right_dist[right_idx] == 0:  # this sequence is longer
-                if left_dist[right_idx] > 0:
-                    node.children[right_idx].key = seq
-                    node.children[right_idx].value = lazy_get_value(seq_idx)
-                    node.child_keys[right_idx, :] = seq
-                else:  # exact sequence exists
-                    node.children[right_idx].usage += 1
-                    pass
-                node = node.children[right_idx]
-            elif left_dist[left_idx] == 0:  # longer sequence already exists
-                node.children[left_idx].usage += 1
-                assert seq_idx == len(sequence_chunks) - 1
-                return
-            else:  # no exact match
-                node.child_keys = TrieNode._append_key(node.child_keys, seq, len(node.children), pad_idx=pad_idx)
-                node.children.append(TrieNode(TrieNode.new_id(), seq, lazy_get_value(seq_idx)))
-                node = node.children[-1]
-
-
-def retrieve_prefix(
-    prefix_cache: TrieNode,
-    sequence: jax.Array,
-    *,
-    chunk_size: int,
-    split_axis: int,
-    pad_idx: int = 2**30,
-    executor: ThreadPoolExecutor | None = None,
-    mesh: Any | None = None,
-):
-    sequence, total_match = np.array(sequence), 0
     assert sequence.ndim == 1
     sequence_len, sequence = sequence.size, TrieNode._pad_to_multiple_of(sequence, chunk_size, pad_idx=pad_idx)
     ns = sequence.shape[-1] // chunk_size
-    values, sequence_chunks = [], np.split(sequence, ns)
+    seq_actual_lens = [(chunk_size if i != ns - 1 else (sequence_len - (ns - 1) * chunk_size)) for i in range(ns)]
+    sequence_chunks = np.split(sequence, ns)
+    if len(ref_vals) < ns:
+        msg = f"Pass at least as many references as there are chunks (size={chunk_size}) in the sequence "
+        msg += f" (size={sequence_len}), so expected at least {ns} references, got {len(ref_vals)=} instead."
+        raise ValueError(msg)
+    visited_refs, store_refs, delete_refs = [], [], []  # which refs to retain and which to delete
 
-    def _construct_output():
-        if sequence_len != total_match:
-            return None, total_match
-        for i, value in enumerate(values):
-            if is_type(value, OffloadedValue):
-                _load = lambda value: jax.block_until_ready(device_put(value.ref, like_shard(value.spec, mesh)))
-                values[i] = _load(value) if executor is None else executor.submit(_load, value)
+    # walk the prefix cache tree
+    with root.lock:
+        node = root
+        for seq_idx, (seq, seq_len) in enumerate(zip(sequence_chunks, seq_actual_lens)):
+            if len(node.children) > 0:
+                left_match, right_match = TrieNode._overlap(node.child_keys, seq, seq_len, pad_idx=pad_idx)
+                best_idx = np.argmax(left_match)
+                left_match, right_match = left_match[best_idx], right_match[best_idx]
+            else:
+                left_match, right_match, best_idx = 0, 0, 2**30  # case 0: no children, add new child
+            if left_match != seq_len:  # append new node
+                node.child_keys = TrieNode._append_key(node.child_keys, seq, seq_len, pad_idx=pad_idx)
+                node.children.append(TrieNode(int(ref_vals[seq_idx])))
+                store_refs.append(int(ref_vals[seq_idx]))
+                node = node.children[-1]
+            elif right_match < left_match:  # replace the node
+                delete_refs.append(node.children[best_idx].value)
+                node.children[best_idx] = TrieNode(int(ref_vals[seq_idx]))
+                node.child_keys.keys[best_idx, :], node.child_keys.key_lens[best_idx] = seq, seq_len
+                store_refs.append(int(ref_vals[seq_idx]))
+                node = node.children[best_idx]
+            else:  # full match, do nothing
+                if best_idx > len(node.children):
+                    break
+                visited_refs.append(int(node.children[best_idx].value))
+                node = node.children[best_idx]
+    visited_refs = list(set(visited_refs) | set(store_refs))
+    return visited_refs, store_refs, delete_refs
 
-        values_future = lambda: [value.result() if hasattr(value, "result") else value for value in values]
-        return (executor.submit(values_future) if executor is not None else values_future()), total_match
 
-    node = prefix_cache
-    for seq in sequence_chunks:
-        if len(node.children) == 0:  # cache ran out of node
-            return _construct_output()
-        left_mask = seq != pad_idx
-        overlaps = TrieNode._overlap_dist(node.child_keys, seq, left_mask)
-        max_idx = np.argmax(overlaps)
-        max_overlap = overlaps[max_idx]
-        if max_overlap == 0:
-            return _construct_output()
-        with prefix_cache.lock:
-            node.children[max_idx].usage += 1
-        values.append(node.children[max_idx].value)
-        node, total_match = node.children[max_idx], total_match + max_overlap
-        # exit early if the entire chunk wasn't found
-        if max_overlap != np.sum(left_mask):
-            break
-    return _construct_output()
+def retrieve_prefix(root: TrieNode, sequence: np.ndarray, *, chunk_size: int, pad_idx: int = 2**30):
+    sequence, total_match, ref_vals = np.array(sequence), 0, []
+    assert sequence.ndim == 1
+    sequence_len, sequence = sequence.size, TrieNode._pad_to_multiple_of(sequence, chunk_size, pad_idx=pad_idx)
+    ns = sequence.shape[-1] // chunk_size
+    seq_actual_lens = [(chunk_size if i != ns - 1 else (sequence_len - (ns - 1) * chunk_size)) for i in range(ns)]
+    visited_refs = []
 
-
-def offload_nodes(prefix_cache: TrieNode, how_many: int = 3):
-    # work in progress, not tested, will probably not work
-    # TODO: switch to [memories](https://docs.jax.dev/en/latest/notebooks/host-offloading.html)
-    node_queue, all_nodes = [prefix_cache], []
-    with prefix_cache.lock:
-        while len(node_queue) > 0:
-            node = node_queue.pop(0)
-            for child in node.children:
-                node_queue.append(child)
-                all_nodes.append(child)
-        sorted_nodes = sorted(all_nodes, key=lambda x: x.usage)
-        offloaded = 0
-        for i, node in enumerate(sorted_nodes):
-            if offloaded >= how_many:
+    with root.lock:
+        node = root
+        for seq, seq_len in zip(np.split(sequence, ns), seq_actual_lens):
+            if len(node.children) == 0:  # cache ran out of node
+                return (total_match, ref_vals), visited_refs
+            left_match, right_match = TrieNode._overlap(node.child_keys, seq, seq_len, pad_idx=pad_idx)
+            exact_match = np.minimum(left_match, right_match)
+            best_idx = np.argmax(exact_match)
+            match_length = exact_match[best_idx]
+            if match_length > 0:
+                visited_refs.append(int(node.children[best_idx].value))
+            node = node.children[best_idx]
+            total_match += int(match_length)
+            if match_length != seq_len:
                 break
-            if is_type(node.value, OffloadedValue):
-                continue
-            value = jax.tree.map(partial(np.asarray, copy=False), jax.device_put(node.value, jax.devices("cpu")[0]))
-            node.value = OffloadedValue(value, like_spec(node.value), jax.tree.map(jax.typeof, node.value))
+            ref_vals.append(node.value)
+    return (total_match, ref_vals), visited_refs
 
 
 ########################################################################################################################
@@ -466,6 +476,8 @@ class ServingLoop:
         decode_cache: KVCache,
         is_server: bool = False,
     ):
+        if not (SyncServer.broadcast("welcome", 0, True, is_server) if jax.process_count() > 1 else is_server):
+            raise ValueError("No processes registered as the main server, at least one process must.")
         self.serve_cfg, self.cfg = serve_cfg, cfg
 
         # setup decode
@@ -498,13 +510,11 @@ class ServingLoop:
         self.prefill_weights = prefill_weights
         self.prefill_mesh = [x for x in jax.tree.leaves(prefill_weights) if hasattr(x, "sharding")][0].sharding.mesh
         self.prefill_work = PrefillWork([], [], [])
-        self.prefix_cache = TrieNode(TrieNode.new_id(), None, None, lock=threading.Lock())
         self._get_index = jax.jit(lambda z, idx: jax.tree.map(lambda x: x[:, idx, ...], z))
         self._get_cache_entry = jax.jit(self.decode_work.cache.get_sequence)
 
         # setup misc
-        self.pending_requests, self.requests_lock, self.results = [], threading.Lock(), {}
-        self.params_lock = threading.Lock()
+        self.pending_requests, self.state_lock, self.results = [], threading.Lock(), {}
         self.pad_id, self.eos_tokens, self.time_axis = 0, np.array(serve_cfg.eos_tokens), TIME_AXIS
         self._background = ThreadPoolExecutor(max_workers=1024)
 
@@ -512,7 +522,6 @@ class ServingLoop:
         self.profile_start_time, self.profiling = -1, False
 
         # setup cache management
-        # -1 for missing batch dimensiona and + 1 for layers being stacked
         self.prefix_cache, self._retrieve_prefix, self._insert_prefix = None, None, None
         self.new_prefix_cache()
 
@@ -563,7 +572,7 @@ class ServingLoop:
 
         # 2. run N decode steps
         output_tokens, output_mapping = [], []
-        if "decode" in self.roles:  # cut a corner, don't issue the decode call on non-participating machines
+        if "decode" in self.roles:  # TODO(rdyro): revisit: don't issue the decode call on non-participating machines
             with use_mesh(self.decode_mesh):
                 config = dict(cfg=self.cfg, steps=self.serve_cfg.decode_steps)
                 (self.decode_work.curr_tokens, self.decode_work.cache), output_tokens = self.multistep_decode_fn(
@@ -609,12 +618,21 @@ class ServingLoop:
                         continue
                     # 2. check for done sequences; evict them if done and return them
                     if done[i]:
-                        if USE_PREFIX_CACHE:
+                        if USE_PREFIX_CACHE:  # store the results in the prefix cache buffer store
                             sequence = np.array(result.token_list)
                             with use_mesh(self.decode_mesh):
                                 cache_entry, _ = self._get_cache_entry(self.decode_work.cache, i)
                             # self._background.submit(self._insert_prefix, sequence, cache_entry, mesh=self.decode_mesh)
-                            self._insert_prefix(sequence, cache_entry, mesh=self.decode_mesh)
+                            ns = math.ceil(sequence.size / self.serve_cfg.prefix_chunk_size)
+                            buffer_ids = BUFFER_STORE._get_unique_buffer_ids(ns)
+                            visited_ids, store_ids, del_ids = self._insert_prefix(sequence, buffer_ids)
+                            if len(store_ids) > 0:
+                                axis = self.time_axis - 1 + 1  # batch missing (-1) layers concatenated (+1)
+                                chunked_cache_entry = _split(cache_entry, axis, self.serve_cfg.prefix_chunk_size, ns)
+                                vals = [chunked_cache_entry[buffer_ids.index(id)] for id in store_ids]
+                                BUFFER_STORE.store(store_ids, vals)
+                            BUFFER_STORE.delete(del_ids)
+                            BUFFER_STORE.mark_visited(visited_ids)
                         return_request(result)
                         result.done, self.decode_work.active_results[i] = True, None
 
@@ -632,42 +650,27 @@ class ServingLoop:
                     self.prefill_work.to_decode.append(PrefillResult(id, input, input[-1], kv_list, len(input) - 1))
                 self.prefill_work.pending_prefill = None
 
-        # 2. triage requests queue into cached (-> decode) and not-cached work (-> prefill)
-        new_pending_retrievals = []
-        done_mask = [cache_entry_fut.done() for (_, cache_entry_fut) in self.prefill_work.pending_cache_retrievals]
-        done_mask = SyncServer.broadcast("retrievals_done", self._it, done_mask, is_source="prefill_coordinator" in self.roles)
-        for i, (request, cache_entry_fut) in enumerate(self.prefill_work.pending_cache_retrievals):
-            #if len(self.prefill_work.to_decode) < self.serve_cfg.decode_batch_size and cache_entry_fut.done():
-            if len(self.prefill_work.to_decode) < self.serve_cfg.decode_batch_size and done_mask[i]:
+        # 2. triage requests based on whether they need to go to prefill or there's a cache match, so decode directly
+        while len(self.prefill_work.requests) > 0:
+            request = self.prefill_work.requests.pop(0)
+            sequence = np.array(request.text)
+            (total_match, buffer_ids), visited_ids = self._retrieve_prefix(sequence)
+            BUFFER_STORE.mark_visited(visited_ids)
+            if total_match == sequence.size:
                 with use_mesh(self.decode_mesh):
-                    # batch missing (-1) layers concatenated (+1)
-                    cache_entry = partial(_concat, cache_entry_fut.result(), self.time_axis - 1 + 1)  # jit work future
-                new_decode = PrefillResult(
-                    request.id, np.array(request.text), request.text[-1], cache_entry, len(request.text) - 1
-                )
+                    time_axis = self.time_axis - 1 + 1  # batch missing (-1) layers concatenated (+1)
+                    cache_entry = partial(_concat, BUFFER_STORE.load(buffer_ids), time_axis)
+                new_decode = PrefillResult(request.id, sequence, request.text[-1], cache_entry, len(request.text) - 1)
                 self.prefill_work.to_decode.append(new_decode)
+                print(f"Found a full match")
             else:
-                new_pending_retrievals.append((request, cache_entry_fut))  # not yet ready
-        self.prefill_work.pending_cache_retrievals = new_pending_retrievals
-
-        # 3. check if prefixes are in the cache
-        retrieval_results = self._background.map(
-            lambda request: (self._retrieve_prefix(np.array(request.text[:-1])), request), self.prefill_work.requests
-        )
-        #retrieval_results = [[(None, -100), request] for request in self.prefill_work.requests]
-        for (cache_entry_fut, length), request in retrieval_results:
-            if length == len(request.text) - 1:
-                self.prefill_work.pending_cache_retrievals.append((request, cache_entry_fut))
-                print(f"Found full prefill match in the cache")
-            else:
-                print(f"Need to prefill the request, only found a match for length {length / (len(request.text) - 1)}")
+                print(f"Need to prefill the request, only found a match for length {total_match / (len(request.text) - 1)}")
                 self.prefill_work.to_prefill.append(request)
-        self.prefill_work.requests.clear()
 
         if self.prefill_work.pending_prefill is not None:  # a current prefill is still running, skip scheduling another
             return
 
-        # 4. prefill requests to be prefilled
+        # 3. prefill requests to be prefilled
         prefill_input = self.prefill_work.to_prefill[: self.serve_cfg.prefill_batch_size]
         self.prefill_work.to_prefill = self.prefill_work.to_prefill[len(prefill_input) :]
         if len(prefill_input) > 0:
@@ -714,9 +717,9 @@ class ServingLoop:
         SyncServer.barrier("serving_step", self._it)
         self._it, requests = self._it + 1, None
         if "server" in self.roles:
-            with self.requests_lock:
+            with self.state_lock:
                 self.pending_requests, requests = [], list(self.pending_requests)
-        with self.params_lock:
+        with self.state_lock:
             serve_cfg, requests = SyncServer.broadcast(
                 "requests", self._it, (dataclasses.asdict(self.serve_cfg), requests), is_source="server" in self.roles
             )
@@ -737,17 +740,20 @@ class ServingLoop:
             self.new_prefix_cache()
         # manage cache #############################################################################
 
+        # offload buffers to keep a max of N #######################################################
+        max_buffers = 100
+        BUFFER_STORE.offload_buffers(max(0, BUFFER_STORE.livecount - max_buffers))
+        # offload buffers to keep a max of N #######################################################
+
     def add_request(self, request: UserRequestPrompt):
-        with self.requests_lock:
+        with self.state_lock:
             self.pending_requests.append(dataclasses.asdict(request))
 
     def update_params(self, params: dict[str, Any]):
-        with self.params_lock:
+        with self.state_lock:
             self.serve_cfg = dataclasses.replace(self.serve_cfg, **params)
 
     def new_prefix_cache(self):
-        self.prefix_cache = TrieNode(TrieNode.new_id(), None, None, lock=threading.Lock())
-        _prefix_opts = dict(chunk_size=self.serve_cfg.prefix_chunk_size)
-        _prefix_opts |= dict(split_axis=self.time_axis - 1 + 1, mesh=self.decode_mesh, executor=self._background)
-        self._retrieve_prefix = partial(retrieve_prefix, self.prefix_cache, **_prefix_opts)
-        self._insert_prefix = partial(insert_prefix, self.prefix_cache, **_prefix_opts)
+        self.prefix_cache = TrieNode(None, lock=threading.Lock())
+        self._retrieve_prefix = partial(retrieve_prefix, self.prefix_cache, chunk_size=self.serve_cfg.prefix_chunk_size)
+        self._insert_prefix = partial(insert_prefix, self.prefix_cache, chunk_size=self.serve_cfg.prefix_chunk_size)

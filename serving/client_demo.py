@@ -121,7 +121,7 @@ def main():
     global responses, MAX_PANEL_LINES, responses_lock, responses_done
     all_prompts = get_prompts()
     prompts_num = 18
-    idxs = np.random.randint(0, len(all_prompts) - 1, prompts_num)
+    idxs = np.random.randint(0, len(all_prompts), prompts_num)
     PROMPTS = [all_prompts[idx] for idx in idxs]
 
     # This controls the "scrolling" effect. It's the max number of lines

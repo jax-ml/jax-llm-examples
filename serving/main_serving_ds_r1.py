@@ -9,12 +9,11 @@ import signal
 import time
 from typing import AsyncGenerator
 from contextlib import asynccontextmanager
-import os
+from argparse import ArgumentParser
 
 import jax
 from jax import random
-from jax.sharding import PartitionSpec as P, AxisType, NamedSharding, auto_axes
-#from llama3_jax import model as l3jax
+from jax.sharding import PartitionSpec as P, AxisType
 from deepseek_r1_jax import model as dsjax
 from deepseek_r1_jax import chkpt_utils as dsjax_utils
 import serving_jax as serving
@@ -26,26 +25,15 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import uvicorn
 
-IS_SERVER = len(sys.argv) > 1 and sys.argv[1] == "server"
-TOKENIZER, SERVE_LOOP, SERVING_THREAD = None, None, None
+TOKENIZER, SERVE_LOOP, SERVING_THREAD, ARGS = None, None, None, None
 
 jax.config.update("jax_explain_cache_misses", True)
-#jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
+jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
 #jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
 #jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
 jax.config.update("jax_enable_empty_arrays", True)
 
-try:  # newer JAX only
-    assert False
-    my_id = int(socket.gethostname().split("-")[-1]) - 1
-    my_ip = socket.getaddrinfo(socket.gethostname(), 80)[0][-1][0]
-    jax.config.update("jax_cross_host_transfer_socket_address", f"{my_ip}:{17007 + my_id}")
-    jax.config.update("jax_cross_host_transport_addresses", ",".join([f"{my_ip}:0"] * 8))
-except: # noqa: E722
-    pass
-
 shutdown_signal = threading.Event()
-
 
 def encode_input(tokenizer, texts, pad_id: int = 0):
     assert isinstance(texts, list)
@@ -55,19 +43,13 @@ def encode_input(tokenizer, texts, pad_id: int = 0):
     max_len = max([len(x) for x in inputs])
     return np.array([(max_len - len(x)) * [pad_id] + x for x in inputs])
 
-
-def _place_local(tree, sharding: NamedSharding, present: bool):
-    return jax.tree.map(
-        lambda z, s: jax.make_array_from_single_device_arrays(
-            z.shape, s, [] if not present else [y.data for y in z.addressable_shards], dtype=z.dtype
-        ),
-        tree,
-        sharding,
-    )
-
-
 def load_model():
-    global SERVE_LOOP, SERVING_THREAD, TOKENIZER
+    global SERVE_LOOP, SERVING_THREAD, TOKENIZER, ARGS
+
+    parser = ArgumentParser()
+    parser.add_argument("--server", action="store_true", help="Make this node the main server.", default=False)
+    ARGS = parser.parse_args()
+
     jax.distributed.initialize()
     print(jax.devices())
     print("-" * 80)
@@ -79,8 +61,7 @@ def load_model():
     print("---> Model config loaded")
 
     mesh = jax.make_mesh((1, 8, jax.device_count() // 8), P("x", "y", "z"), devices=jax.devices(), axis_types=(AxisType.Auto,) * 3)
-    decode_mesh, prefill_mesh = mesh, mesh
-    cfg = dataclasses.replace(dsjax.Config(), mesh=mesh)
+    cfg = dataclasses.replace(dsjax.Config(), mesh=mesh)#, num_layers=4)
     weights = dsjax_utils.load_model(ckpt_path, cfg)
     decode_weights, prefill_weights = weights, weights
 
@@ -91,7 +72,7 @@ def load_model():
     decode_cache.get_sequence = attention_cache_utils.kvcache_get_entry
     decode_cache.insert_sequences = attention_cache_utils.kvcache_update_cache
     SERVE_LOOP = serving.ServingLoop(
-        serve_cfg, cfg, dsjax.prefill, prefill_weights, dsjax.decode_step, decode_weights, decode_cache, is_server=IS_SERVER
+        serve_cfg, cfg, dsjax.prefill, prefill_weights, dsjax.decode_step, decode_weights, decode_cache, ARGS.server
     )
     print("---> Created the serving loop")
 
@@ -198,7 +179,7 @@ async def root():
 
 
 if __name__ == "__main__":
-    if IS_SERVER:
+    if ARGS.server:
         print(f"jax.process_idx() == {jax.process_index()}")
         uvicorn.run(APP, host="0.0.0.0", port=8081, reload=False, server_header=False)
     else:
