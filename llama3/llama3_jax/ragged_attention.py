@@ -316,17 +316,7 @@ def test_main(interpret=False):
     mesh = jax.make_mesh((jax.device_count(),), ("x",))
 
     @partial(jax.jit, static_argnames=("which", "block_kv", "block_bs"))
-    def fn(
-        q,
-        k,
-        v,
-        starts,
-        lengths,
-        qk_prev=None,
-        which: str = "pallas",
-        block_kv: int = 128,
-        block_bs: int = 8
-    ):
+    def fn(q, k, v, starts, lengths, qk_prev=None, which: str = "pallas", block_kv: int = 128, block_bs: int = 8):
         k, k_scale = k if isinstance(k, tuple) else (k, None)
         v, v_scale = v if isinstance(v, tuple) else (v, None)
         kv_heads = k.shape[1]
@@ -411,6 +401,7 @@ def test_main(interpret=False):
     err = err / jnp.linalg.norm(ret_ref.astype(jnp.float32), axis=-1)
     err = jnp.mean(err, -1)
     print(f"{err = }")
+
 
 if __name__ == "__main__":
     test_main()
