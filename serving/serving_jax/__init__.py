@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import dataclasses
-from functools import partial
+from functools import partial, wraps
 from typing import Any, Callable
 import math
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -43,7 +43,7 @@ PyTree, PyTreeStruct = Any, Any
 
 TIME_AXIS = 2
 USE_PREFIX_CACHE = True  # the eviction mechanism is extremely simple right now
-#USE_PREFIX_CACHE = False
+# USE_PREFIX_CACHE = False
 is_type = lambda x, cls: (type(x).__name__ == cls.__name__) and (type(x).__module__ == cls.__module__)
 
 ########################################################################################################################
@@ -98,6 +98,7 @@ def _ensure_all_args_on_mesh(*args, mesh: Mesh):
 # kv cache buffer management ###########################################################################################
 ########################################################################################################################
 
+
 @partial(jax.jit, static_argnames=("axis", "chunk_size", "ns"))
 def _split(val: jax.Array | list[jax.Array], axis: int, chunk_size: int, ns: int) -> list[jax.Array]:
     def _fn(val):
@@ -133,7 +134,7 @@ class KVBufferStore:
     def offload_buffers(self, how_many: int):
         if how_many == 0:
             return
-        candidates = sorted(self._store.keys(), key=lambda i: self.usecount[i] if self.ondevice[i] else 2 ** 60)
+        candidates = sorted(self._store.keys(), key=lambda i: self.usecount[i] if self.ondevice[i] else 2**60)
         for i in candidates[:how_many]:
             if self.ondevice[i]:
                 shrd = jax.tree.map(lambda x: x.sharding.with_memory_kind("pinned_host"), self._store[i])
@@ -168,6 +169,7 @@ class KVBufferStore:
             return [self.mark_visited(i) for i in id]
         self.usecount[id] += 1
 
+
 BUFFER_STORE = KVBufferStore()
 
 ########################################################################################################################
@@ -175,6 +177,7 @@ BUFFER_STORE = KVBufferStore()
 ########################################################################################################################
 
 EMPTY, HASH_BITWIDTH = -1, 1
+
 
 @dataclasses.dataclass
 class ChildKeys:
@@ -194,7 +197,12 @@ def _hash_encode(v: np.ndarray, hash_bitwidth: int = HASH_BITWIDTH, pad_idx: int
 
 
 def _prefilter_on_hash(
-    w: np.ndarray, keys: np.ndarray, vh: np.ndarray, vm: np.ndarray, hash_bitwidth: int = HASH_BITWIDTH, pad_idx: int = EMPTY
+    w: np.ndarray,
+    keys: np.ndarray,
+    vh: np.ndarray,
+    vm: np.ndarray,
+    hash_bitwidth: int = HASH_BITWIDTH,
+    pad_idx: int = EMPTY,
 ):
     wh, wm = _hash_encode(w, hash_bitwidth=hash_bitwidth, pad_idx=pad_idx)
     inv_match = (wh ^ vh) & vm & wm
@@ -202,6 +210,7 @@ def _prefilter_on_hash(
     match_len = np.sum(np.cumsum(inv_match, axis=-1) == 0, axis=-1) + (w[0] == keys[:, 0])
     max_match_len = max(np.max(match_len), 1)
     return np.where(match_len == max_match_len)[0]
+
 
 def _fast_pad(x, size, axis, pad_val=0):
     new_buf = pad_val * np.ones([size - s if i == axis else s for i, s in enumerate(x.shape)], dtype=x.dtype)
@@ -344,6 +353,9 @@ def retrieve_prefix(root: TrieNode, sequence: np.ndarray, *, chunk_size: int, pa
 next_power_of_2 = lambda x: 2 ** round(math.ceil(math.log2(x)))
 like_spec = lambda z: jax.tree.map(lambda x: jax.typeof(x).sharding.spec, z)
 like_shard = lambda z, mesh: jax.tree.map(lambda x: NamedSharding(mesh, jax.typeof(x).sharding.spec), z)
+_make_empty = lambda x, mesh: jax.make_array_from_single_device_arrays(
+    x.shape, NamedSharding(mesh, x.sharding.spec), [], dtype=x.dtype
+)
 
 
 @dataclasses.dataclass
@@ -446,7 +458,15 @@ def _make_multistep_decode_fn(decode_fn):
         (curr_tokens, cache), output_tokens = jax.lax.scan(body, (curr_tokens, cache), length=steps)
         return (curr_tokens, cache), output_tokens[..., 0].T
 
-    return multistep_decode_fn
+    @wraps(multistep_decode_fn)
+    def wrapped(curr_tokens, decode_weights, cache, cfg, steps: int = 32, *, participate: bool = True):
+        if participate:
+            return multistep_decode_fn(curr_tokens, decode_weights, cache, cfg, steps=steps)
+        else:
+            _make_empty_, fn = partial(_make_empty, mesh=cfg.mesh), multistep_decode_fn
+            return jax.tree.map(_make_empty_, jax.eval_shape(fn, curr_tokens, decode_weights, cache, cfg, steps=steps))
+
+    return wrapped
 
 
 def _make_stacked_prefill(prefill_fn):
@@ -461,7 +481,15 @@ def _make_stacked_prefill(prefill_fn):
         stacked_kv = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *kv_list)
         return next_tokens, logits, stacked_kv
 
-    return lambda inputs, weights, cfg: stacked_prefill(_numpy_pad_tokens(inputs), weights, cfg)
+    @wraps(stacked_prefill)
+    def wrapped(inputs, weights, cfg, *, participate: bool = True):
+        if participate:
+            return stacked_prefill(_numpy_pad_tokens(inputs), weights, cfg)
+        else:
+            _make_empty_ = partial(_make_empty, mesh=cfg.mesh)
+            return jax.tree.map(_make_empty_, jax.eval_shape(stacked_prefill, _numpy_pad_tokens(inputs), weights, cfg))
+
+    return wrapped
 
 
 class ServingLoop:
@@ -476,8 +504,8 @@ class ServingLoop:
         decode_cache: KVCache,
         is_server: bool = False,
     ):
-        if not (SyncServer.broadcast("welcome", 0, True, is_server) if jax.process_count() > 1 else is_server):
-            raise ValueError("No processes registered as the main server, at least one process must.")
+        if not SyncServer.broadcast("welcome", 0, is_server, is_server):
+            raise ValueError("Neither this proccess nor any other processe is the main server, at least one must.")
         self.serve_cfg, self.cfg = serve_cfg, cfg
 
         # setup decode
@@ -506,7 +534,7 @@ class ServingLoop:
         self.decode_output = (None, None)
 
         # setup prefill
-        self.prefill_fn = staticmethod(_make_stacked_prefill(prefill_fn))
+        self.prefill_fn = _make_stacked_prefill(prefill_fn)
         self.prefill_weights = prefill_weights
         self.prefill_mesh = [x for x in jax.tree.leaves(prefill_weights) if hasattr(x, "sharding")][0].sharding.mesh
         self.prefill_work = PrefillWork([], [], [])
@@ -572,19 +600,16 @@ class ServingLoop:
 
         # 2. run N decode steps
         output_tokens, output_mapping = [], []
-        if "decode" in self.roles:  # TODO(rdyro): revisit: don't issue the decode call on non-participating machines
-            with use_mesh(self.decode_mesh):
-                config = dict(cfg=self.cfg, steps=self.serve_cfg.decode_steps)
-                (self.decode_work.curr_tokens, self.decode_work.cache), output_tokens = self.multistep_decode_fn(
-                    self.decode_work.curr_tokens, self.decode_weights, self.decode_work.cache, **config
-                )
-                output_mapping = [
-                    [getattr(result, "id", -1) for result in self.decode_work.active_results]
-                ] * self.serve_cfg.decode_steps
-                output_mapping = np.array(output_mapping).T
-            print(
-                f"Decoding with fill rate of {np.mean([result is not None for result in self.decode_work.active_results])}"
+        with use_mesh(self.decode_mesh):
+            config = dict(cfg=self.cfg, steps=self.serve_cfg.decode_steps, participate="decode" in self.roles)
+            (self.decode_work.curr_tokens, self.decode_work.cache), output_tokens = self.multistep_decode_fn(
+                self.decode_work.curr_tokens, self.decode_weights, self.decode_work.cache, **config
             )
+            output_mapping = [
+                [getattr(result, "id", -1) for result in self.decode_work.active_results]
+            ] * self.serve_cfg.decode_steps
+            output_mapping = np.array(output_mapping).T
+        print(f"Decoding with fill rate: {np.mean([result is not None for result in self.decode_work.active_results])}")
 
         # 3. parse output tokens from previous decoding loop to allow for the tokens arrive (delayed EOS detection)
         self.decode_output, (output_tokens, output_mapping) = (output_tokens, output_mapping), self.decode_output
@@ -607,8 +632,7 @@ class ServingLoop:
                 (output_tokens_flat, output_mapping_flat, done),
                 is_source="decode_coordinator" in self.roles,
             )
-            #if "server" in self.roles or "decode_coordinator" in self.roles:
-            for token, id in zip(output_tokens.reshape(-1).tolist(), output_mapping.reshape(-1).tolist()):
+            for token, id in zip(output_tokens_flat, output_mapping_flat):
                 if id > 0:
                     self.results[id].token_list.append(token)
                     self.results[id].tokens_decoded += 1
@@ -664,7 +688,9 @@ class ServingLoop:
                 self.prefill_work.to_decode.append(new_decode)
                 print(f"Found a full match")
             else:
-                print(f"Need to prefill the request, only found a match for length {total_match / (len(request.text) - 1)}")
+                print(
+                    f"Need to prefill the request, only found a match for length {total_match / (len(request.text) - 1)}"
+                )
                 self.prefill_work.to_prefill.append(request)
 
         if self.prefill_work.pending_prefill is not None:  # a current prefill is still running, skip scheduling another
@@ -684,7 +710,9 @@ class ServingLoop:
                 inputs = np.pad(inputs, ((0, row_pad), (0, col_pad)), mode="constant", constant_values=self.pad_id)
                 cfg = dataclasses.replace(self.cfg, mesh=self.prefill_mesh)
                 with use_mesh(self.prefill_mesh):
-                    _, _, prefill_results = self.prefill_fn(inputs, self.prefill_weights, cfg)
+                    _, _, prefill_results = self.prefill_fn(
+                        inputs, self.prefill_weights, cfg, participate="prefill" in self.roles
+                    )
                     prefill_results = jax.block_until_ready(prefill_results)
                 return prefill_input, prefill_results
 
@@ -719,10 +747,10 @@ class ServingLoop:
         if "server" in self.roles:
             with self.state_lock:
                 self.pending_requests, requests = [], list(self.pending_requests)
+        serve_cfg, requests = SyncServer.broadcast(
+            "requests", self._it, (dataclasses.asdict(self.serve_cfg), requests), is_source="server" in self.roles
+        )
         with self.state_lock:
-            serve_cfg, requests = SyncServer.broadcast(
-                "requests", self._it, (dataclasses.asdict(self.serve_cfg), requests), is_source="server" in self.roles
-            )
             self.serve_cfg = dataclasses.replace(self.serve_cfg, **serve_cfg)
         for request in requests:
             self.total_requests += 1
