@@ -24,6 +24,7 @@ from etils import epath
 import gzip
 import json
 from pathlib import Path
+from warnings import warn
 
 import jax
 import jax.numpy as jnp
@@ -67,6 +68,7 @@ class ShardingRules:
     taking this mapping and eventually turning it into the correct JAX shardings
     and sharding contraints.
     """
+
     batch: AxisName = BATCH_AXIS_NAME
     sequence: AxisName = None
     head_dim: AxisName = None
@@ -209,6 +211,7 @@ def load_tokenizer(
 # module reload friendly check for type(x) == cls
 is_type = lambda x, cls: (type(x).__name__ == cls.__name__) and (type(x).__module__ == cls.__module__)
 is_param = lambda x: is_type(x, ArrayInfo)
+which_platform = lambda cfg: cfg.mesh.devices.reshape(-1)[0].platform
 _count_left_padding = lambda ids, pad_id=PAD_ID: jnp.sum(jnp.cumsum(ids != pad_id, axis=-1) == 0, axis=-1)
 _length_minus_right_padding = lambda segment_ids: jnp.sum(jnp.cumsum(jnp.flip(segment_ids != 0, -1), axis=-1) > 0, -1)
 
@@ -225,6 +228,7 @@ class ArrayInfo:
     the ArrayInfo approach instead to decouple data and its sharding from the functions we'll apply the data to.
 
     """
+
     shape: tuple[int, ...]
     dtype: "jnp.dtype"
     logical_axes: tuple
@@ -240,6 +244,7 @@ def _init_leaves(key, abstract, shardings):
         return jax.tree.map(
             lambda info: info.initializer(next(key_iter), info.shape, info.dtype), abstract, is_leaf=is_param
         )
+
     return _init_fn(key)
 
 
@@ -289,8 +294,10 @@ class QuantArray:
     shape = property(lambda self: self.quant.shape)
     ndim = property(lambda self: self.quant.ndim)
 
+
 _int8_quant_init = lambda key, shape, dtype=jnp.int8: random.randint(key, shape, -128, 128, dtype=dtype)
 _int8_scale_init = lambda key, shape, dtype: random.normal(key, shape, dtype=dtype) / math.sqrt(math.prod(shape)) / 127
+
 
 def quantize(x: jax.Array | ArrayInfo, axis: int | tuple[int, ...], scale_dtype=jnp.float16, zero_init: bool = False):
     if is_type(x, QuantArray):
@@ -318,7 +325,7 @@ def quantize(x: jax.Array | ArrayInfo, axis: int | tuple[int, ...], scale_dtype=
             quant_init, scale_init = _int8_quant_init, _int8_scale_init
         return (
             dataclasses.replace(x, shape=x.shape, dtype=jnp.int8, initializer=quant_init),
-            ArrayInfo(new_shape, scale_dtype, new_logical_axes, scale_init)
+            ArrayInfo(new_shape, scale_dtype, new_logical_axes, scale_init),
         )
 
     raise ValueError(f"quantize got unexpected type: {type(x)}")
@@ -327,7 +334,8 @@ def quantize(x: jax.Array | ArrayInfo, axis: int | tuple[int, ...], scale_dtype=
 def quantize_update_slice(x: QuantArray, y: jax.Array, pos: int, update_axis: int, quant_axis: int):
     assert x.quant.ndim == y.ndim
     quant_axis, update_axis = quant_axis % x.quant.ndim, update_axis % x.quant.ndim  # normalize axis numbers
-    y_quant, y_scale = quantize(y, axis=quant_axis, scale_dtype=x.scale.dtype)  # quantize rhs
+    # y_quant, y_scale = quantize(y, axis=quant_axis, scale_dtype=x.scale.dtype)  # quantize rhs
+    y_quant, y_scale = y.quant, y.scale
     scale_update_axis = [ax for ax in range(x.quant.ndim) if ax != quant_axis][update_axis]  # update axis in `scale`
     z_quant = jax.lax.dynamic_update_slice_in_dim(x.quant, y_quant.astype(x.quant.dtype), pos, axis=update_axis)
     z_scale = jax.lax.dynamic_update_slice_in_dim(x.scale, y_scale.astype(x.scale.dtype), pos, axis=scale_update_axis)
@@ -385,39 +393,41 @@ class MoELayer(_Init):
         _sinit = jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
         dtype = cfg.dtype
         layer = MoELayer(
-            w_router=ArrayInfo(
-                (cfg.embed, cfg.n_routed_experts), cfg.moe_gate_dtype, ("moe_e_up_embed", None), _sinit
-            ),
-            b_router=ArrayInfo(
-                (cfg.n_routed_experts,), cfg.moe_gate_dtype, (None,), jax.nn.initializers.constant(0.0)
-            ),
+            w_router=ArrayInfo((cfg.embed, cfg.n_routed_experts), cfg.moe_gate_dtype, ("moe_e_up_embed", None), _sinit),
+            b_router=ArrayInfo((cfg.n_routed_experts,), cfg.moe_gate_dtype, (None,), jax.nn.initializers.constant(0.0)),
             we_gate=ArrayInfo(
-                (cfg.n_routed_experts, cfg.embed, cfg.moe_ffw_size), dtype,
+                (cfg.n_routed_experts, cfg.embed, cfg.moe_ffw_size),
+                dtype,
                 ("moe_e_experts", "moe_e_up_embed", "moe_e_up_ffw"),
                 _einit,
             ),
             we_up=ArrayInfo(
-                (cfg.n_routed_experts, cfg.embed, cfg.moe_ffw_size), dtype,
+                (cfg.n_routed_experts, cfg.embed, cfg.moe_ffw_size),
+                dtype,
                 ("moe_e_experts", "moe_e_up_embed", "moe_e_up_ffw"),
                 _einit,
             ),
             we_down=ArrayInfo(
-                (cfg.n_routed_experts, cfg.moe_ffw_size, cfg.embed), dtype,
+                (cfg.n_routed_experts, cfg.moe_ffw_size, cfg.embed),
+                dtype,
                 ("moe_e_experts", "moe_e_down_ffw", "moe_e_down_embed"),
                 _einit,
             ),
             ws_gate=ArrayInfo(
-                (cfg.embed, cfg.n_shared_experts * cfg.moe_ffw_size), dtype,
+                (cfg.embed, cfg.n_shared_experts * cfg.moe_ffw_size),
+                dtype,
                 ("moe_s_up_embed", "moe_s_up_ffw"),
                 _sinit,
             ),
             ws_up=ArrayInfo(
-                (cfg.embed, cfg.n_shared_experts * cfg.moe_ffw_size), dtype,
+                (cfg.embed, cfg.n_shared_experts * cfg.moe_ffw_size),
+                dtype,
                 ("moe_s_up_embed", "moe_s_up_ffw"),
                 _sinit,
             ),
             ws_down=ArrayInfo(
-                (cfg.moe_ffw_size, cfg.n_shared_experts * cfg.embed), dtype,
+                (cfg.moe_ffw_size, cfg.n_shared_experts * cfg.embed),
+                dtype,
                 ("moe_s_down_ffw", "moe_s_down_embed"),
                 _sinit,
             ),
@@ -463,7 +473,8 @@ class AttentionLayer(_Init):
             q_a=ArrayInfo((cfg.embed, cfg.q_lora_rank), dtype, ("qkv_embed", "q_lora"), _init(1)),
             q_gamma=ArrayInfo((cfg.q_lora_rank,), dtype, ("q_lora",), _ones_init),
             q_b=ArrayInfo(
-                (cfg.q_lora_rank, cfg.num_heads, q_head_dim), dtype,
+                (cfg.q_lora_rank, cfg.num_heads, q_head_dim),
+                dtype,
                 ("q_lora", "qkv_heads", "head_dim"),
                 _init(1, 2),
             ),
@@ -471,7 +482,8 @@ class AttentionLayer(_Init):
             k_pe=ArrayInfo((cfg.embed, cfg.qk_rope_head_dim), dtype, ("qkv_embed", "head_dim"), _init(1)),
             kv_gamma=ArrayInfo((cfg.kv_lora_rank,), dtype, ("kv_lora",), _ones_init),
             k_b=ArrayInfo(
-                (cfg.kv_lora_rank, cfg.num_heads, cfg.qk_nope_head_dim), dtype,
+                (cfg.kv_lora_rank, cfg.num_heads, cfg.qk_nope_head_dim),
+                dtype,
                 ("kv_lora", "qkv_heads", "head_dim"),
                 _init(1, 2),
             ),
@@ -587,9 +599,9 @@ class KVCache(_Init):
             _init,
         )
         k_pe_info = ArrayInfo(
-            (batch_size, max_seq_len, cfg.qk_rope_head_dim),
+            (batch_size, 1, max_seq_len, cfg.qk_rope_head_dim),
             dtype,
-            ("batch", "sequence", "head_dim"),
+            ("batch", None, "sequence", "head_dim"),
             _init,
         )
         v_info = ArrayInfo(
@@ -609,17 +621,10 @@ class KVCache(_Init):
         if cfg.quantize_cache:
             _quantize = partial(quantize, axis=-1, scale_dtype=cfg.quant_scale_dtype, zero_init=True)
             cache.k_nope = [
-                QuantArray(*_quantize(k_nope), out_scaling=True, scale_expand_dims=-2)
-                for k_nope in cache.k_nope
+                QuantArray(*_quantize(k_nope), out_scaling=True, scale_expand_dims=-2) for k_nope in cache.k_nope
             ]
-            cache.k_pe = [
-                QuantArray(*_quantize(k_pe), out_scaling=True, scale_expand_dims=(-2, -3))
-                for k_pe in cache.k_pe
-            ]
-            cache.v = [
-                QuantArray(*_quantize(v), out_scaling=False, scale_expand_dims=-2)
-                for v in cache.v
-            ]
+            cache.k_pe = [QuantArray(*_quantize(k_pe), out_scaling=True, scale_expand_dims=-2) for k_pe in cache.k_pe]
+            cache.v = [QuantArray(*_quantize(v), out_scaling=False, scale_expand_dims=-2) for v in cache.v]
         return cache
 
     def fill_len(self) -> jax.Array:
@@ -650,7 +655,10 @@ def update_slice(x: jax.Array | QuantArray, y: jax.Array, pos: int, update_axis:
     else:
         return jax.lax.dynamic_update_slice_in_dim(x, y.astype(x.dtype), pos, axis=update_axis)
 
-def logical_sharding_constraint(x: jax.Array | QuantArray, logical_axes: Axes, mesh: jax.sharding.Mesh, rules: ShardingRules):
+
+def logical_sharding_constraint(
+    x: jax.Array | QuantArray, logical_axes: Axes, mesh: jax.sharding.Mesh, rules: ShardingRules
+):
     """Generate a sharding constraint for a regular or QuantArray given its logical axes."""
     sharding = logical_to_sharding(logical_axes, mesh, rules)
     if is_type(x, QuantArray):
@@ -717,8 +725,8 @@ def apply_rotary_embedding(x, sin, cos):
 
 
 def make_attention_mask(q_len, k_len, q_segment_ids, kv_segment_ids, q_offset, kv_offset, causal: bool):
-    segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :] # [B, t, T]
-    segment_mask = segment_mask[:, None, :, :] # [B, t, T] -> [B, 1, t, T]
+    segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]  # [B, t, T]
+    segment_mask = segment_mask[:, None, :, :]  # [B, t, T] -> [B, 1, t, T]
 
     if causal:
         qk = (1, 1, q_len, k_len)  # [b, h, t, T]
@@ -772,7 +780,8 @@ def attention(
     _, h, T, _ = k_nope.shape
 
     qk = einsum("bhtd,bhTd->bhtT", q_nope, k_nope)
-    qk = qk + einsum("bhtd,bTd->bhtT", q_pe, k_pe)
+    # qk = qk + einsum("bhtd,bTd->bhtT", q_pe, k_pe)
+    qk = qk + einsum("bhtd,b1Td->bhtT", q_pe, k_pe)
     qk = qk * scale  # [b, h, t, T]
 
     mask = make_attention_mask(t, T, q_segment_ids, kv_segment_ids, q_offset, kv_offset, cfg.causal)
@@ -785,63 +794,75 @@ def attention(
     return qkv.reshape((b, h, t, v.shape[-1]))
 
 
-def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, q_offset, starts, lengths, cfg: Config):
+def attention_kernel(
+    q_nope: jax.Array,
+    q_pe: jax.Array,
+    k_nope: jax.Array | tuple[jax.Array, jax.Array],
+    k_pe: jax.Array | tuple[jax.Array, jax.Array],
+    v: jax.Array | tuple[jax.Array, jax.Array],
+    q_segment_ids: jax.Array,
+    kv_segment_ids: jax.Array,
+    q_offset: jax.Array,
+    kv_offset: jax.Array,
+    cfg: Config,
+) -> jax.Array:
     """Flash attention kernel!"""
-    k, k_scale = (k.quant, k.scale) if is_type(k, QuantArray) else (k, None)
+    k_nope, k_nope_scale = (k_nope.quant, k_nope.scale) if is_type(k_nope, QuantArray) else (k_nope, None)
+    k_pe, k_pe_scale = (k_pe.quant, k_pe.scale) if is_type(k_pe, QuantArray) else (k_pe, None)
     v, v_scale = (v.quant, v.scale) if is_type(v, QuantArray) else (v, None)
+    scale = _get_attn_scale(q_nope.shape[-1] + q_pe.shape[-1], cfg)
 
-    # handle grouped query attention
-    assert q.shape[-3] % k.shape[-3] == 0
-    scale = _get_attn_scale(q.shape[-1], cfg)
+    l2p = lambda *logical: logical_to_physical(logical, cfg.rules)
+    q_spec = l2p("batch", "qkv_heads", "sequence", "head_dim")
 
-    l2p = lambda *xs: logical_to_physical(xs, cfg.rules)
     in_specs = (
-        l2p("batch", "act_heads", "sequence", "head_dim"),
-        l2p("batch", "act_heads", "sequence", "head_dim"),
-        l2p("batch", "act_heads", "sequence", "head_dim"),
-        l2p("batch", "sequence"),
-        l2p("batch", "sequence"),
-        l2p("batch") if starts is not None else None,
-        l2p("batch") if lengths is not None else None,
-        l2p("batch", "act_heads", "sequence") if k_scale is not None else None,
-        l2p("batch", "act_heads", "sequence") if v_scale is not None else None,
+        q_spec,  # q_nope
+        q_spec,  # q_pe
+        l2p("batch", "qkv_heads", "sequence", "head_dim"),  # k_nope
+        l2p("batch", None, "sequence", "head_dim"),  # k_pe
+        l2p("batch", "qkv_heads", "sequence", "head_dim"),  # v
+        l2p("batch", "sequence"),  # q_segment_ids
+        l2p("batch", "sequence"),  # kv_segment_ids
+        None if k_nope_scale is None else l2p("batch", "qkv_heads", "sequence"),  # k_nope_scale
+        None if k_pe_scale is None else l2p("batch", None, "sequence"),  # k_pe_scale
+        None if v_scale is None else l2p("batch", "qkv_heads", "sequence"),  # v_scale
     )
-    out_specs = l2p("batch", "act_heads", "sequence", "head_dim")
+    out_specs = q_spec
 
     @partial(shard_map, mesh=cfg.mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False)
-    def _f(q, k, v, q_segment_ids, kv_segment_ids, starts, lengths, k_scale, v_scale):
-        q_org_shape = q.shape
-        kv_repeats = q.shape[-3] // k.shape[-3]
-        q = q.reshape(q.shape[:-3] + (k.shape[-3], kv_repeats, q.shape[-2], q.shape[-1]))
+    def _f(q_nope, q_pe, k_nope, k_pe, v, q_segment_ids, kv_segment_ids, k_nope_scale, k_pe_scale, v_scale):
+        q_seq, kv_seq, heads = q_nope.shape[-2], v.shape[-2], v.shape[-3]
+        block_q, block_kv = min(q_seq, 512), min(kv_seq, 1024)
+        block_sizes = splash.BlockSizes(block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv)
 
-        if q.shape[-2] != 1:
-            mask = mask_lib.MultiHeadMask([mask_lib.CausalMask((q.shape[-2], k.shape[-2])) for _ in range(q.shape[-3])])
-            block_q, block_kv = min(q.shape[-2], 512), min(k.shape[-2], 1024)
-            block_sizes = splash.BlockSizes(block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv)
-            attn_fn = splash.make_splash_mqa_single_device(mask=mask, block_sizes=block_sizes)
-            attn_fn = jax.vmap(jax.vmap(attn_fn, in_axes=(0, 0, 0, None)), in_axes=(0, 0, 0, 0))
+        mask = mask_lib.MultiHeadMask([mask_lib.CausalMask((q_seq, kv_seq)) for _ in range(heads)])
+        attn_static_fn = splash.make_splash_mha_single_device(mask=mask, block_sizes=block_sizes)
+        attn_static_fn = jax.vmap(attn_static_fn, in_axes=(0, 0, 0, 0))  # for prefill with an empty cache
 
-            segment_ids = splash.SegmentIds(q=q_segment_ids, kv=kv_segment_ids)
-            if k_scale is not None:
-                k = (k * k_scale[..., None]).astype(jnp.bfloat16)
-            if v_scale is not None:
-                v = (v * v_scale[..., None]).astype(jnp.bfloat16)
-            ret = attn_fn(q * scale, k, v, segment_ids)
-        else:
-            raise NotImplementedError
-            assert q.shape[-2] == 1, "This is a decode kernel, q.shape[-2] must be 1"
-            q = q[..., 0, :]
-            in_axes = (1, 1, 1, None, None)
-            in_axes += ((None if k_scale is None else 1),)
-            in_axes += ((None if v_scale is None else 1),)
-            hyperparams = dict(scale=scale, block_kv=min(k.shape[-2], 8192))
-            ret = jax.vmap(partial(ragged_attention.ragged_decode_fwd, **hyperparams), in_axes=in_axes, out_axes=1)(  # noqa: F821
-                q, k, v, starts, lengths, k_scale, v_scale
-            )
-        return ret.reshape(q_org_shape[:-1] + (v.shape[-1],))
+        def attn_dynamic_fn(q, k, v, segment_ids):  # when the offsets are different (chunked prefill)
+            mask = make_attention_mask(q_seq, kv_seq, q_segment_ids, kv_segment_ids, q_offset, kv_offset, causal=True)
+            attn_fn = lambda q, k, v, segment_ids, mask: splash.make_splash_mha_single_device(
+                mask=mask, block_sizes=block_sizes
+            )(q, k, v, segment_ids)
+            return jax.vmap(attn_fn, in_axes=(0, 0, 0, 0, 0))(q, k, v, segment_ids, mask)
 
-    lengths = jnp.broadcast_to(lengths, starts.shape)
-    return _f(q, k, v, q_segment_ids, kv_segment_ids, starts, lengths, k_scale, v_scale).astype(jnp.bfloat16)
+        segment_ids = splash.SegmentIds(q=q_segment_ids, kv=kv_segment_ids)
+        if k_nope_scale is not None:
+            k_nope = (k_nope * k_nope_scale[..., None]).astype(jnp.bfloat16)
+        if k_pe_scale is not None:
+            k_pe = (k_pe * k_pe_scale[..., None]).astype(jnp.bfloat16)
+        if v_scale is not None:
+            v = (v * v_scale[..., None]).astype(jnp.bfloat16)
+        k = jnp.concatenate([k_nope, jnp.broadcast_to(k_pe, k_nope.shape[:-1] + k_pe.shape[-1:])], -1)
+        q = jnp.concatenate([q_nope, q_pe], -1)
+        # jax.debug.print("Using a static mask: {}", jnp.all(q_offset == kv_offset))
+        return jax.lax.cond(
+            jnp.all(q_offset == kv_offset), attn_static_fn, attn_dynamic_fn, q * scale, k, v, segment_ids
+        )
+
+    return _f(q_nope, q_pe, k_nope, k_pe, v, q_segment_ids, kv_segment_ids, k_nope_scale, k_pe_scale, v_scale).astype(
+        jnp.bfloat16
+    )
 
 
 def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
@@ -871,18 +892,27 @@ def mla_attention_block(
     with jax.named_scope("kv_compressed_embed"):
         kv_compressed = einsum("btd,dr->btr", x, attn_layer.kv_a).astype(dtype)
         kv_compressed = rms_norm(kv_compressed, attn_layer.kv_gamma).astype(dtype)
-        k_pe = einsum("btd,dq->btq", x, attn_layer.k_pe)
-        k_pe = apply_rotary_embedding(k_pe[..., None, :, :], sin, cos)[..., 0, :, :].astype(dtype)
+        # k_pe = einsum("btd,dq->btq", x, attn_layer.k_pe)
+        # k_pe = apply_rotary_embedding(k_pe[..., None, :, :], sin, cos)[..., 0, :, :].astype(dtype)
+        k_pe = einsum("btd,dq->btq", x, attn_layer.k_pe)[..., None, :, :]
+        k_pe = apply_rotary_embedding(k_pe, sin, cos).astype(dtype)
 
     with jax.named_scope("kv_embed"):
         k_nope = einsum("btr,rhq->bhtq", kv_compressed, attn_layer.k_b)
         v = einsum("btr,rhv->bhtv", kv_compressed, attn_layer.v_b)
 
+    if cfg.quantize_cache:
+        _quantize = partial(quantize, axis=-1, scale_dtype=cfg.quant_scale_dtype)
+        k_nope = QuantArray(*_quantize(k_nope), out_scaling=True, scale_expand_dims=-2)
+        k_pe = QuantArray(*_quantize(k_pe), out_scaling=True, scale_expand_dims=-2)
+        v = QuantArray(*_quantize(v), out_scaling=False, scale_expand_dims=-2)
+
     with jax.named_scope("full_cache_update"):
         if is_type(cache, KVCache):
             it = jnp.maximum(cache.iter, 0)
             k_nope = update_slice(cache.k_nope[idx], k_nope, it, update_axis=cache.time_axis)
-            k_pe = update_slice(cache.k_pe[idx], k_pe, it, update_axis=cache.time_axis - 1)
+            # k_pe = update_slice(cache.k_pe[idx], k_pe, it, update_axis=cache.time_axis - 1)
+            k_pe = update_slice(cache.k_pe[idx], k_pe, it, update_axis=cache.time_axis)
             v = update_slice(cache.v[idx], v, it, update_axis=cache.time_axis)
             cache_updates = (k_nope, k_pe, v)
 
@@ -905,24 +935,14 @@ def mla_attention_block(
     lsc = partial(logical_sharding_constraint, mesh=cfg.mesh, rules=cfg.rules)
     spec = ("batch", "act_heads", "sequence", "head_dim")
     q_nope, q_pe = lsc(q_nope, spec), lsc(q_pe, spec)
-    k_nope, k_pe, v = lsc(k_nope, spec), lsc(k_pe, ("batch", "sequence", "head_dim")), lsc(v, spec)
+    # k_nope, k_pe, v = lsc(k_nope, spec), lsc(k_pe, ("batch", "sequence", "head_dim")), lsc(v, spec)
+    k_nope, k_pe, v = lsc(k_nope, spec), lsc(k_pe, ("batch", None, "sequence", "head_dim")), lsc(v, spec)
 
     # Compute attention
     with jax.named_scope("attention"):
-        if (cfg.use_prefill_attn_kernel and q.shape[-2] != 1) or (cfg.use_decode_attn_kernel and q.shape[-2] == 1):
-            raise NotImplementedError
+        if which_platform(cfg) == "tpu" and cfg.use_prefill_attn_kernel and q.shape[-2] != 1:
             attn_out = attention_kernel(
-                q_nope,
-                q_pe,
-                k_nope,
-                k_pe,
-                v,
-                q_segment_ids,
-                kv_segment_ids,
-                q_offset,
-                starts=starts,
-                lengths=lengths,
-                cfg=cfg,
+                q_nope, q_pe, k_nope, k_pe, v, q_segment_ids, kv_segment_ids, q_offset, kv_offset, cfg=cfg
             )
         else:
             attn_out = attention(q_nope, q_pe, k_nope, k_pe, v, q_segment_ids, kv_segment_ids, q_offset, kv_offset, cfg)
@@ -1108,26 +1128,26 @@ def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
                 if expert_axname is not None:
                     ff_out_expert = jax.lax.psum(ff_out_expert, expert_axname)
             else:
-              # collectives
-              if is_embedding_sharded:  # activations are supposed to be sharded on out
-                  with jax.named_scope("tp_e_psum_scatter"):
-                      ff_out_expert = jax.lax.psum_scatter(
-                          ff_out_expert, tensor_axname, scatter_dimension=1, tiled=True
-                      )
-                  with jax.named_scope("ep_e_psum"):
-                      if expert_axname is not None:
-                          ff_out_expert = jax.lax.psum(ff_out_expert, expert_axname)
-              else:
-                  psum_axes = tensor_axname if expert_axname is None else (expert_axname, tensor_axname)
-                  ff_out_expert = jax.lax.psum(ff_out_expert, psum_axes)
+                # collectives
+                if is_embedding_sharded:  # activations are supposed to be sharded on out
+                    with jax.named_scope("tp_e_psum_scatter"):
+                        ff_out_expert = jax.lax.psum_scatter(
+                            ff_out_expert, tensor_axname, scatter_dimension=1, tiled=True
+                        )
+                    with jax.named_scope("ep_e_psum"):
+                        if expert_axname is not None:
+                            ff_out_expert = jax.lax.psum(ff_out_expert, expert_axname)
+                else:
+                    psum_axes = tensor_axname if expert_axname is None else (expert_axname, tensor_axname)
+                    ff_out_expert = jax.lax.psum(ff_out_expert, psum_axes)
             ff_out_expert = ff_out_expert.reshape((b, s, ff_out_expert.shape[-1]))
             return ff_out_expert
 
     with jax.named_scope("moe_routed_expert"):
         x_ = psc(x, x_spec)
-        ff_out_expert = _expert_fn(x_, we_gate, we_up, we_down, topk_weights, topk_idx)[..., :x.shape[-1]]
+        ff_out_expert = _expert_fn(x_, we_gate, we_up, we_down, topk_weights, topk_idx)[..., : x.shape[-1]]
     with jax.named_scope("moe_shared_expert"):
-        ff_out_shared = mlp_block(x, MLPLayer(layer.ws_gate, layer.ws_up, layer.ws_down), cfg)[..., :x.shape[-1]]
+        ff_out_shared = mlp_block(x, MLPLayer(layer.ws_gate, layer.ws_up, layer.ws_down), cfg)[..., : x.shape[-1]]
     return psc(ff_out_expert + ff_out_shared, l2p("batch", "sequence", "act_embed"))
 
 
@@ -1185,7 +1205,7 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     positions = segment_ids_to_positions(segment_ids)
     if is_type(cache, KVCache):
         positions = positions + cache.fill_len()[:, None]
-    sin, cos = generate_pos_embeddings(positions, cfg.qk_rope_head_dim, cfg) # [B, T, head_dim]
+    sin, cos = generate_pos_embeddings(positions, cfg.qk_rope_head_dim, cfg)  # [B, T, head_dim]
     sin, cos = sin.astype(cfg.dtype), cos.astype(cfg.dtype)
 
     all_cache_updates = []
@@ -1251,7 +1271,7 @@ def prefill(tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, pa
         uninitialized_iter = -jnp.ones_like(cache.iter)
         cache = dataclasses.replace(cache, starts=_count_left_padding(prompt, pad_id=pad_id), iter=uninitialized_iter)
     else:
-        cache_shardings = tuple([z[idx] for idx in range(cfg.num_layers)] for z in cache_shardings)
+        cache_shardings = [tuple(z[idx] for z in cache_shardings.buffers) for idx in range(cfg.num_layers)]
     logits_shardings = logical_to_sharding(("batch", "sequence", "act_embed"), cfg.mesh, cfg.rules)
     logits, cache = jax.jit(forward, donate_argnums=(4,), out_shardings=(logits_shardings, cache_shardings))(
         prompt, prompt_segment_ids, weights, cfg, cache
