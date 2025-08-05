@@ -48,13 +48,16 @@ def transfer_tree_A2B(xs: PyTree, meshA, meshB):
     xs, xs_struct = jax.tree.flatten(xs)
     combined_sharding = [NamedSharding(meshC, P("cross_mesh", *x.sharding.spec)) for x in xs]
     dest_sharding = [NamedSharding(meshB, x.sharding.spec) for x in xs]
-    dest_arrays = _make_zeros(tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in xs), tuple(dest_sharding))
-    all_arrays = [x_src._arrays + x_dest._arrays for x_src, x_dest in zip(_prepare_arrays(xs), dest_arrays)]
+    with jax.sharding.set_mesh(meshB):
+        dest_arrays = _make_zeros(tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in xs), tuple(dest_sharding))
+    with jax.sharding.set_mesh(meshA):
+        all_arrays = [x_src._arrays + x_dest._arrays for x_src, x_dest in zip(_prepare_arrays(xs), dest_arrays)]
     xs_combined = [
         jax.make_array_from_single_device_arrays((2,) + x.shape, sharding, arrays, dtype=x.dtype)
         for (x, arrays, sharding) in zip(xs, all_arrays, combined_sharding)
     ]
-    xs_repl = _combine(xs_combined)  # issue collectives under jit
+    with jax.sharding.set_mesh(meshC):
+        xs_repl = _combine(xs_combined)  # issue collectives under jit
     xs_new = [
         jax.make_array_from_single_device_arrays(
             x_src.shape, sharding, x_new._arrays[len(x_src._arrays) :], dtype=x_src.dtype

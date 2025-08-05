@@ -8,8 +8,8 @@ import signal
 import time
 from typing import AsyncGenerator
 from contextlib import asynccontextmanager
-import os
 from argparse import ArgumentParser
+from typing import Any
 
 import jax
 from jax import random
@@ -24,16 +24,15 @@ from llama3_jax import model as l3jax
 import serving_jax as serving
 from serving_jax import attention_cache_utils
 
+Config = Any
 
 TOKENIZER, SERVE_LOOP, SERVING_THREAD, ARGS = None, None, None, None
 
 jax.config.update("jax_explain_cache_misses", True)
-jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
-jax.config.update("jax_enable_empty_arrays", True)
+#jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
 
 try:  # newer JAX only
-    assert False
-    my_id = int(socket.gethostname().split("-")[-1]) - 1
+    my_id = int(socket.gethostname().split("-")[-1])
     my_ip = socket.getaddrinfo(socket.gethostname(), 80)[0][-1][0]
     jax.config.update("jax_cross_host_transfer_socket_address", f"{my_ip}:{17007 + my_id}")
     jax.config.update("jax_cross_host_transport_addresses", ",".join([f"{my_ip}:0"] * 8))
@@ -60,39 +59,60 @@ def load_model():
 
     #process_idx = int(socket.gethostname().split("-")[-1]) - 1  # a scheme where hosts are (host-1, host-2, ...)
     #jax.distributed.initialize(os.environ["COORDINATOR_ADDRESS"], 2, process_idx)
+    jax.distributed.initialize()
     print(jax.devices())
     print("-" * 80)
     print(jax.local_devices())
 
-    model_name = "Llama-3.1-8B-Instruct"
-    ckpt_path = Path(f"~/{model_name}").expanduser()
+    #model_name = "Llama-3.1-8B-Instruct"
+    #ckpt_path = Path(f"~/{model_name}").expanduser()
+    #model_name = "Llama-3.1-8B-Instruct-quant"
+    model_name = "Llama-3.1-70B-Instruct-quant"
+    ckpt_path = Path(f"~/bucket/llama3_jax_old/{model_name}").expanduser()
     cfg = l3jax.load_config(ckpt_path / "config.json")
     TOKENIZER = l3jax.load_tokenizer(ckpt_path / "tokenizer.json", ckpt_path / "tokenizer_config.json")
     assert ckpt_path.is_dir()
     print("---> Model config loaded")
 
     # two hosts, different device and host meshes
-    local_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.local_devices(), axis_types=(AxisType.Explicit,) * 3)
-    decode_mesh, prefill_mesh = local_mesh, local_mesh
+    #local_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.local_devices(), axis_types=(AxisType.Explicit,) * 3)
+    #local_mesh = jax.make_mesh((1, 1, 1), P("x", "y", "z"), devices=jax.local_devices(), axis_types=(AxisType.Explicit,) * 3)
+    #decode_mesh, prefill_mesh = local_mesh, local_mesh
+    decode_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[:8], axis_types=(AxisType.Explicit,) * 3)
+    prefill_mesh = jax.make_mesh((1, 8, 1), P("x", "y", "z"), devices=jax.devices()[8:], axis_types=(AxisType.Explicit,) * 3)
+    #decode_mesh = jax.make_mesh((1, 8, 2), P("x", "y", "z"), devices=jax.devices(), axis_types=(AxisType.Explicit,) * 3)
+    #prefill_mesh = jax.make_mesh((1, 8, 2), P("x", "y", "z"), devices=jax.devices(), axis_types=(AxisType.Explicit,) * 3)
     cfg = dataclasses.replace(cfg, mesh=decode_mesh, quant_layer=True, quant_cache=True)
-    cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=False, use_decode_attn_kernel=False, max_seq_len=8192)
-    cfg = dataclasses.replace(cfg, quant_layer=False, quant_cache=False)
-    cfg.quant_cache = True
+    cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=False, use_decode_attn_kernel=False, max_seq_len=2048)
+    cfg.quant_cache = False
 
     decode_weights = l3jax.load_pytree(ckpt_path, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=decode_mesh)))
     prefill_weights = l3jax.load_pytree(ckpt_path, l3jax.Weights.shardings(dataclasses.replace(cfg, mesh=prefill_mesh)))
 
     print("---> Weights loaded")
 
-    serve_cfg = serving.ServingConfig(decode_steps=32, max_decode_length=64)
-    #decode_cache = l3jax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size)
-    #decode_cache.get_sequence = attention_cache_utils.kvcache_get_entry
-    #decode_cache.insert_sequences = attention_cache_utils.kvcache_update_cache
-    decode_cache = l3jax.PagedKVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, 2048, 32)
-    decode_cache.get_sequence = attention_cache_utils.batch_paged_get_entry
-    decode_cache.insert_sequences = attention_cache_utils.batch_paged_update_sequences
+    serve_cfg = serving.ServingConfig(decode_steps=32, max_decode_length=64, prefix_chunk_size=64)
+    decode_cache = l3jax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size)
+    decode_cache.get_sequence = attention_cache_utils.kvcache_get_entry
+    decode_cache.insert_sequences = attention_cache_utils.kvcache_update_cache
+    #decode_cache = l3jax.PagedKVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, 2048, 32)
+    #decode_cache.get_sequence = attention_cache_utils.batch_paged_get_entry
+    #decode_cache.insert_sequences = attention_cache_utils.batch_paged_update_sequences
+
+    def init_cache(cfg: Config, batch_size: int, actual_len: int):
+        cache = l3jax.KVCache.init(random.key(0), cfg, batch_size)
+        cache.get_sequence = attention_cache_utils.kvcache_get_entry
+        cache.insert_sequences = attention_cache_utils.kvcache_update_cache
+        cache.iter = actual_len
+        return cache
+
+    with jax.sharding.set_mesh(prefill_mesh):
+        prefill_cache = init_cache(dataclasses.replace(cfg, mesh=prefill_mesh), serve_cfg.prefill_batch_size, 8192)
+
+    forward_fn = l3jax.decode_step   # TODO: the model file needs to call it forward explcitly
     SERVE_LOOP = serving.ServingLoop(
-        serve_cfg, cfg, l3jax.prefill, prefill_weights, l3jax.decode_step, decode_weights, decode_cache, ARGS.server
+        #serve_cfg, cfg, init_cache, l3jax.decode_step, prefill_weights, decode_weights, decode_cache, ARGS.server
+        serve_cfg, cfg, forward_fn, prefill_weights, prefill_cache, decode_weights, decode_cache, ARGS.server
     )
     print("---> Created the serving loop")
 

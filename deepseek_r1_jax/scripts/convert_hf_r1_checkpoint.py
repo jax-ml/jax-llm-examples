@@ -19,13 +19,15 @@ from pathlib import Path
 
 import jax
 from jax.sharding import PartitionSpec as P
+from argparse import ArgumentParser
 
-from deepseek_r1_jax.model import ShardingRules, Config
-from deepseek_r1_jax import chkpt_utils as utils
 
-def main():
-    root_path = Path("/mnt/storage/DeepSeek-R1")
-    dest_path = Path("/mnt/storage/deepseek-r1-jax-chkpt")
+def main(root_path, dest_path):
+    from deepseek_r1_jax.model import ShardingRules, Config
+    from deepseek_r1_jax import chkpt_utils as utils
+
+    root_path, dest_path = Path(root_path), Path(dest_path)
+    dest_path.mkdir(exist_ok=True, parents=True)
 
     cfg = Config()
     cfg.quantize_mlp = False
@@ -39,4 +41,17 @@ def main():
     utils.convert_hf_checkpoint(params_map, root_path, dest_path, cfg)
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--source-path", default="/mnt/storage/DeepSeek-R1-weights-only", required=True, help="HF model directory path"
+    )
+    parser.add_argument(
+        "--dest-path",
+        default="~/deepseek_r1_jax",
+        required=True,
+        help="JAX model model directory (to be created).",
+    )
+    args = parser.parse_args()
+    main(args.source_path, args.dest_path)
+
+    main(args)

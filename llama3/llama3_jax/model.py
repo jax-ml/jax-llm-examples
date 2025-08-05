@@ -21,8 +21,8 @@ from pathlib import Path
 import math
 from functools import partial
 from typing import Callable, Any, TypeVar
-from types import ModuleType
 from inspect import signature
+from collections import OrderedDict as odict
 
 import jax
 import jax.numpy as jnp
@@ -31,7 +31,8 @@ from jax import tree_util
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as splash
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
 from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec as P, use_mesh
+from jax.sharding import PartitionSpec as P
+from jax.experimental.array_serialization import pytree_serialization as ser
 try:
     from jax.experimental.shard import auto_axes as _auto_axes, reshard
 except ModuleNotFoundError:
@@ -213,6 +214,7 @@ class ArrayInfo:
 # module reload friendly isinstance check
 is_type = lambda x, cls: (type(x).__name__ == cls.__name__) and (type(x).__module__ == cls.__module__)
 is_param = lambda x: is_type(x, ArrayInfo)
+which_platform = lambda cfg: cfg.mesh.devices.reshape(-1)[0].platform
 _count_left_padding = lambda ids, pad_id=0: auto_axes(
     lambda ids: jnp.sum(jnp.cumsum(ids != pad_id, axis=-1) == 0, axis=-1), out_sharding=P(None)
 )(ids)
@@ -404,15 +406,18 @@ class Weights(_Init):
         )
 
 
-@partial(jax_pytree_struct, meta_fields=("batch_size", "size", "time_axis"))
+@partial(jax_pytree_struct, meta_fields=("batch_size", "size", "time_axis", "insert_sequences"))
 class KVCache(_Init):
     k: list[tuple[jax.Array | QuantArray, ...]]  # (batch_size, key_heads, max_seq_len, head_dim)
     v: list[tuple[jax.Array | QuantArray, ...]]  # (batch_size, key_heads, max_seq_len, head_dim)
     iter: jax.Array  # []  # sequences are right-aligned for slice update performance
     starts: jax.Array  # [batch_size]  # sequences are right-aligned, we need start indices
-    batch_size: int = 0
+    batch_size: int = 1
     size: int = 2 ** 30
     time_axis: int = 2
+    #update_slice: Callable = None
+    insert_sequences: Callable = None
+    #get_sequence: Callable = None
 
     @classmethod
     def abstract(cls, cfg: Config, batch_size: int):
@@ -798,6 +803,8 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, q_offset, starts, l
 
 
 def paged_attention_kernel(q, k, v, block_tables, lengths, cfg: Config):
+    if which_platform(cfg) not in ("gpu", "cuda"):
+        raise ValueError("Paged attention is only supported on GPU.")
     k, k_scale = (k.quant, k.scale) if is_type(k, QuantArray) else (k, None)
     v, v_scale = (v.quant, v.scale) if is_type(v, QuantArray) else (v, None)
 
@@ -1028,6 +1035,17 @@ def prepare_chunk(chunk, pad_to: int, pad_id: int):
     chunk = jnp.pad(chunk, [(0, 0), (0, pad_to - chunk.shape[-1])])
     segment_ids = jnp.where(chunk != pad_id, 1, 0).astype(jnp.int32)
     return chunk, segment_ids
+
+
+## serialization
+#def save_pytree(data, path):
+#    flat_data = odict(("weights" + "".join(map(str, k)), v) for k, v in jax.tree.flatten_with_path(data)[0])
+#    ser.save(flat_data, path)  # save a flatten with path to avoid custom
+#
+#
+#def load_pytree(path, sharding=None):
+#    flat_sharding = odict(("weights" + "".join(map(str, k)), v) for k, v in jax.tree.flatten_with_path(sharding)[0])
+#    return jax.tree.unflatten(jax.tree.structure(sharding), jax.tree.leaves(ser.load(path, flat_sharding)))
 
 
 def prefill(tokens: jax.Array, weights: Weights, cache: KVCache | None, cfg: Config, pad_id: int = 0):
