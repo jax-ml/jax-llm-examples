@@ -5,10 +5,11 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
-#jax.config.update("jax_enable_empty_arrays", True)
+# jax.config.update("jax_enable_empty_arrays", True)
 PyTree = Any
 
 

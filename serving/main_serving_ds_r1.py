@@ -1,39 +1,40 @@
-import sys
-import dataclasses
-import time
-from pathlib import Path
-import threading
 import asyncio
-import socket
+import dataclasses
 import signal
+import socket
+import sys
+import threading
 import time
-from typing import AsyncGenerator
-from contextlib import asynccontextmanager
 from argparse import ArgumentParser
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncGenerator
 
 import jax
-from jax import random
-from jax.sharding import PartitionSpec as P, AxisType
-from deepseek_r1_jax import model as dsjax
-from deepseek_r1_jax import chkpt_utils as dsjax_utils
-import serving_jax as serving
-from serving_jax import attention_cache_utils
 import numpy as np
-
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, Response
-from pydantic import BaseModel
+import serving_jax as serving
 import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, StreamingResponse
+from jax import random
+from jax.sharding import AxisType
+from jax.sharding import PartitionSpec as P
+from pydantic import BaseModel
+from serving_jax import attention_cache_utils
+
+from deepseek_r1_jax import chkpt_utils as dsjax_utils
+from deepseek_r1_jax import model as dsjax
 
 TOKENIZER, SERVE_LOOP, SERVING_THREAD, ARGS = None, None, None, None
 
 jax.config.update("jax_explain_cache_misses", True)
 jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
-#jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
-#jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
 jax.config.update("jax_enable_empty_arrays", True)
 
 shutdown_signal = threading.Event()
+
 
 def encode_input(tokenizer, texts, pad_id: int = 0):
     assert isinstance(texts, list)
@@ -42,6 +43,7 @@ def encode_input(tokenizer, texts, pad_id: int = 0):
     ]
     max_len = max([len(x) for x in inputs])
     return np.array([(max_len - len(x)) * [pad_id] + x for x in inputs])
+
 
 def load_model():
     global SERVE_LOOP, SERVING_THREAD, TOKENIZER, ARGS
@@ -60,17 +62,20 @@ def load_model():
     assert ckpt_path.is_dir()
     print("---> Model config loaded")
 
-    mesh = jax.make_mesh((1, 8, jax.device_count() // 8), P("x", "y", "z"), devices=jax.devices(), axis_types=(AxisType.Auto,) * 3)
-    cfg = dataclasses.replace(dsjax.Config(), mesh=mesh)#, num_layers=4)
+    mesh = jax.make_mesh(
+        (1, 8, jax.device_count() // 8), P("x", "y", "z"), devices=jax.devices(), axis_types=(AxisType.Auto,) * 3
+    )
+    cfg = dataclasses.replace(dsjax.Config(), mesh=mesh)  # , num_layers=4)
     weights = dsjax_utils.load_model(ckpt_path, cfg)
     decode_weights, prefill_weights = weights, weights
 
     print("---> Weights loaded")
-    serve_cfg = serving.ServingConfig(decode_steps=32, max_decode_length=64,
-                                      decode_batch_size=8, prefill_batch_size=1, prefix_chunk_size=64)
+    serve_cfg = serving.ServingConfig(
+        decode_steps=32, max_decode_length=64, decode_batch_size=8, prefill_batch_size=1, prefix_chunk_size=64
+    )
     decode_cache = dsjax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, cfg.max_seq_len)
-    decode_cache.get_sequence = attention_cache_utils.kvcache_get_entry
-    decode_cache.insert_sequences = attention_cache_utils.kvcache_update_cache
+    decode_cache.get_sequence = attention_cache_utils.kvcache_get_sequence
+    decode_cache.insert_sequences = attention_cache_utils.kvcache_insert_sequences
     SERVE_LOOP = serving.ServingLoop(
         serve_cfg, cfg, dsjax.prefill, prefill_weights, dsjax.decode_step, decode_weights, decode_cache, ARGS.server
     )
@@ -82,6 +87,7 @@ def load_model():
                 SERVE_LOOP.serving_step()
         except Exception as e:
             import traceback
+
             print(traceback.format_exc(), flush=True)
             print(f"Exception {e}", flush=True)
         finally:
@@ -112,7 +118,7 @@ class GenerateRequest(BaseModel):
     text: str
 
 
-#async def generate_generator(params: GenerateRequest, request: Request) -> AsyncGenerator[str, None]:
+# async def generate_generator(params: GenerateRequest, request: Request) -> AsyncGenerator[str, None]:
 async def generate_generator(id: int, text: str, request: Request) -> AsyncGenerator[str, None]:
     if id in SERVE_LOOP.results:
         del SERVE_LOOP.results[id]

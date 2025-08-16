@@ -119,9 +119,7 @@ def jax_pytree_struct(cls, meta_fields: tuple = ()):
         cls = dataclasses.dataclass(cls)
     all_fields = tuple(f.name for f in dataclasses.fields(cls) if f.init)
     data_fields = tuple(f for f in all_fields if f not in meta_fields)
-    # return register_dataclass_serialization(
-    return tree_util.register_dataclass(cls, data_fields=data_fields, meta_fields=meta_fields)  # ,
-    # serialize_auxdata=lambda *args: b"", deserialize_auxdata=lambda *args: ())
+    return tree_util.register_dataclass(cls, data_fields=data_fields, meta_fields=meta_fields)
 
 
 jax_static = lambda cls: tree_util.register_static(dataclasses.dataclass(cls))
@@ -1008,22 +1006,33 @@ def forward(
 
 
 # serialization
-def save_pytree(data, path):
-    import orbax.checkpoint as ocp
+#def save_pytree(data, path):
+#    import orbax.checkpoint as ocp
+#
+#    with ocp.PyTreeCheckpointer() as ckptr:
+#        ckptr.save(epath.Path(path), data, ocp.args.PyTreeSave(data, ocdbt_target_data_file_size=1024 * 1024 * 100))
+#
+#
+#def load_pytree(path, sharding=None):
+#    import orbax.checkpoint as ocp
+#
+#    item, transforms = sharding, None
+#    restore_args = jax.tree.map(lambda s: ocp.ArrayRestoreArgs(sharding=s), sharding)
+#    with ocp.PyTreeCheckpointer() as ckptr:
+#        return ckptr.restore(
+#            epath.Path(path), ocp.args.PyTreeRestore(item=item, transforms=transforms, restore_args=restore_args)
+#        )
 
-    with ocp.PyTreeCheckpointer() as ckptr:
-        ckptr.save(epath.Path(path), data, ocp.args.PyTreeSave(data, ocdbt_target_data_file_size=1024 * 1024 * 100))
+# serialization
+def save_pytree(weights, path):
+    flat_data = odict(("weights" + "".join(map(str, k)), v) for k, v in jax.tree.flatten_with_path(weights)[0])
+    ser.save(flat_data, path)  # save a flatten with path to avoid custom
 
 
 def load_pytree(path, sharding=None):
-    import orbax.checkpoint as ocp
-
-    item, transforms = sharding, None
-    restore_args = jax.tree.map(lambda s: ocp.ArrayRestoreArgs(sharding=s), sharding)
-    with ocp.PyTreeCheckpointer() as ckptr:
-        return ckptr.restore(
-            epath.Path(path), ocp.args.PyTreeRestore(item=item, transforms=transforms, restore_args=restore_args)
-        )
+    flat_sharding = odict(("weights" + "".join(map(str, k)), v) for k, v in jax.tree.flatten_with_path(sharding)[0])
+    data = jax.tree.unflatten(jax.tree.structure(sharding), jax.tree.leaves(ser.load(path, flat_sharding)))
+    return data
 
 
 # Inference.

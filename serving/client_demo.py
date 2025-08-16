@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-import threading
-import time
-import requests
-from typing import List
-import textwrap
-import sys
+import base64
 import gzip
 import json
-import base64
+import sys
+import textwrap
+import threading
+import time
 from pathlib import Path
-
-from rich.live import Live
-from rich.panel import Panel
-from rich.layout import Layout
-from rich.console import Console
-from rich.text import Text
+from typing import List
 
 import numpy as np
+import requests
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.text import Text
 
 # --- Configuration ---
 SERVER_URL = "http://localhost:8081"
