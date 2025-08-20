@@ -16,14 +16,19 @@ import contextlib
 import dataclasses
 import json
 import math
+from pprint import pformat
 import threading
 import time
+import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, NamedTuple
+import logging
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax._src import distributed
 from jax.sharding import Mesh, NamedSharding, set_mesh
 from jax.sharding import PartitionSpec as P
 
@@ -31,16 +36,27 @@ try:
     from jax.experimental.shard import auto_axes
 except ModuleNotFoundError:
     from jax.sharding import auto_axes
-import numpy as np
-from jax._src import distributed
-from jax._src.lib import xla_client as xc
+try:
+    from jax.sharding import use_mesh
+
+    set_mesh = use_mesh
+except ImportError:
+    pass
 
 from .cross_host import transfer_tree_A2B
 
 KVCache, Weights, Config = Any, Any, Any
 PyTree, PyTreeStruct = Any, Any
+AttentionWrapper = NamedTuple(
+    "AttentionWrapper", [("cache", KVCache), ("get_sequence", Callable), ("insert_sequences", Callable)]
+)
 
-is_type = lambda x, cls: (type(x).__name__ == cls.__name__) and (type(x).__module__ == cls.__module__)
+logger = logging.getLogger("serving_jax")
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(levelname)s:%(filename)s:%(lineno)d: %(message)s"))
+logger.handlers = [handler]
+logger.setLevel("INFO")
+DEBUG, INFO, WARN = logger.debug, logger.info, logger.warning
 
 ########################################################################################################################
 # device put for cross-process/hosts transfers #########################################################################
@@ -49,6 +65,8 @@ is_type = lambda x, cls: (type(x).__name__ == cls.__name__) and (type(x).__modul
 
 def unsafe_device_put(xs: PyTree, spec: PyTree, dest_mesh: Mesh):
     """Fastest, but local single-process JAX only for now."""
+    from jax._src.lib import xla_client as xc
+
     xs_flat, xs_struct = jax.tree.flatten(xs)
     shardings_list = [NamedSharding(dest_mesh, s) for s in jax.tree.leaves(spec)]
     devices_list = [s._internal_device_list for s in shardings_list]
@@ -391,14 +409,14 @@ class SyncServer:
     @staticmethod
     def barrier(key: str, current_it: int) -> None:
         client = SyncServer._get_client()
-        if client is None:
+        if client is None or jax.process_count() == 1:
             return
         client.wait_at_barrier(key + str(current_it), timeout_in_ms=SyncServer.TIMEOUT_SEC * 1000)
 
     @staticmethod
     def broadcast(key: str, current_it: int, value: Any, is_source: bool = False, jsonify: bool = True) -> None:
         client = SyncServer._get_client()
-        if client is None:
+        if client is None or jax.process_count() == 1:
             return value
         if is_source:
             client.key_value_set(key + str(current_it), json.dumps(value) if jsonify else value)
@@ -477,7 +495,7 @@ class PrefillWork:
 def return_request(resp: DecodeResult):
     # an optional callback called with results available on decode nodes only
     # something happens here to output the response to the global queue
-    # print(f"Finished request: {resp.id}")
+    # INFO(f"Finished request: {resp.id}")
     pass
 
 
@@ -527,62 +545,65 @@ class ServingLoop:
         cfg: Config,
         forward_fn: Callable,
         prefill_weights: Weights,
-        prefill_cache: KVCache,
+        prefill_cache_wrapper: AttentionWrapper,
         decode_weights: Weights,
-        decode_cache: KVCache,
+        decode_cache_wrapper: AttentionWrapper,
         is_server: bool = False,
     ):
-        # self.init_cache = init_cache
-        self.prefill_cache = prefill_cache
         if not SyncServer.broadcast("welcome", 0, is_server, is_server):
             raise ValueError("Neither this proccess nor any other processe is the main server, at least one must.")
         self.serve_cfg, self.cfg = serve_cfg, cfg
 
-        # setup decode
+        # setup decode #
         self.forward_fn, self.decode_weights = forward_fn, decode_weights
         self.decode_mesh = [x for x in jax.tree.leaves(decode_weights) if hasattr(x, "sharding")][0].sharding.mesh
-        with set_mesh(self.decode_mesh):
-            self.decode_work = DecodeWork(None, decode_cache, [None for _ in range(serve_cfg.decode_batch_size)])
-            self.decode_work.curr_tokens = jax.device_put(
-                jnp.zeros((serve_cfg.decode_batch_size, 1), dtype=jnp.int32), P()
-            )
-        self.multistep_decode_fn = _make_multistep_decode_fn(self.forward_fn)
-        self._update_index = jax.jit(
-            lambda x, i, new: x.at[i, ...].set(new[:, None], mode="drop", out_sharding=jax.typeof(x).sharding)
+        self.decode_work = DecodeWork(
+            None, decode_cache_wrapper.cache, [None for _ in range(serve_cfg.decode_batch_size)]
         )
+        with set_mesh(self.decode_mesh):
+            self.decode_work.curr_tokens = jax.device_put(jnp.zeros((serve_cfg.decode_batch_size, 1), dtype=int), P())
+        self.multistep_decode_fn = maybe_call(_make_multistep_decode_fn(self.forward_fn), self.decode_mesh)
+        _update_tokens = lambda x, i, new: x.at[i, ...].set(new[:, None], mode="drop")
+        self._update_tokens = jax.jit(
+            lambda x, i, new: auto_axes(_update_tokens, out_sharding=jax.typeof(x).sharding)(x, i, new)
+        )
+        self._get_decode_cache_entry = jax.jit(decode_cache_wrapper.get_sequence)
+        self.decode_output = (None, None)
 
         def _update_cache_and_index(cache: KVCache, curr_tokens: jax.Array, new_tokens, kvs, batch_idxs, actual_lens):
             # sort to minimize variants num
             length_sort = sorted(range(len(kvs)), key=lambda i: jax.tree.leaves(kvs[i])[0].shape[-2])
             sorted_args = [[x[i] for i in length_sort] for x in (kvs, batch_idxs, actual_lens)]
-            new_cache = decode_cache.insert_sequences(cache, *sorted_args)
+            new_cache = decode_cache_wrapper.insert_sequences(cache, *sorted_args)
             with set_mesh(self.decode_mesh):
-                new_curr_tokens = self._update_index(curr_tokens, np.array(batch_idxs), np.array(new_tokens))
+                new_curr_tokens = self._update_tokens(curr_tokens, np.array(batch_idxs), np.array(new_tokens))
             return new_cache, new_curr_tokens
 
         self._update_cache_and_index = _update_cache_and_index
-        self.decode_output = (None, None)
 
-        # setup prefill
+        # setup prefill ################################################################################################
         self.prefill_weights = prefill_weights
+        self.prefill_cache = prefill_cache_wrapper.cache
         self.prefill_mesh = [x for x in jax.tree.leaves(prefill_weights) if hasattr(x, "sharding")][0].sharding.mesh
         self.prefill_work = PrefillWork([], [], [])
         self._get_index = jax.jit(lambda z, idx: jax.tree.map(lambda x: x[:, idx, ...], z))
-        self._get_cache_entry = jax.jit(self.decode_work.cache.get_sequence)
+        self.prefill_fn = maybe_call(self.forward_fn, self.prefill_mesh)
+        self._get_prefill_cache_entry = maybe_call(jax.jit(prefill_cache_wrapper.get_sequence), self.prefill_mesh)
+        self._prefill_insert_sequences = maybe_call(prefill_cache_wrapper.insert_sequences, self.prefill_mesh)
 
-        # setup misc
+        # setup misc ###################################################################################################
         self.pending_requests, self.state_lock, self.results = [], threading.Lock(), {}
         self.pad_id, self.eos_tokens = 0, np.array(serve_cfg.eos_tokens)
         self._background = ThreadPoolExecutor(max_workers=1024)
-
-        # setup profiling
         self.profile_start_time, self.profiling = -1, False
 
-        # setup cache management
+        # setup prefix cache management ################################################################################
         self.prefix_cache, self._retrieve_prefix, self._insert_prefix = None, None, None
-        self.new_prefix_cache()
+        self.prefix_cache = TrieNode(None, lock=threading.Lock())
+        self._retrieve_prefix = partial(retrieve_prefix, self.prefix_cache, chunk_size=self.serve_cfg.prefix_chunk_size)
+        self._insert_prefix = partial(insert_prefix, self.prefix_cache, chunk_size=self.serve_cfg.prefix_chunk_size)
 
-        # setup the sync server for multi-host
+        # setup the sync server for multi-host #########################################################################
         self._it, self.roles = 0, (("server",) if is_server else ())  # main server
         if any(d.id in [d_.id for d_ in self.decode_mesh.devices.reshape(-1)] for d in jax.local_devices()):
             self.roles += ("decode",)  # any node which has decode mesh devices
@@ -629,15 +650,14 @@ class ServingLoop:
         output_tokens, output_mapping = [], []
         with set_mesh(self.decode_mesh):
             config = dict(cfg=self.cfg, steps=self.serve_cfg.decode_steps)
-            decode_fn = maybe_call(self.multistep_decode_fn, self.decode_mesh)
-            (self.decode_work.curr_tokens, self.decode_work.cache), output_tokens = decode_fn(
+            (self.decode_work.curr_tokens, self.decode_work.cache), output_tokens = self.multistep_decode_fn(
                 self.decode_work.curr_tokens, self.decode_weights, self.decode_work.cache, **config
             )
             output_mapping = [
                 [getattr(result, "id", -1) for result in self.decode_work.active_results]
             ] * self.serve_cfg.decode_steps
             output_mapping = np.array(output_mapping).T
-        print(f"Decoding with fill rate: {np.mean([result is not None for result in self.decode_work.active_results])}")
+        INFO(f"Decoding with fill rate: {np.mean([result is not None for result in self.decode_work.active_results])}")
 
         # 3. parse output tokens from previous decoding loop to allow for the tokens arrive (delayed EOS detection)
         self.decode_output, (output_tokens, output_mapping) = (output_tokens, output_mapping), self.decode_output
@@ -674,7 +694,7 @@ class ServingLoop:
                         result.done, self.decode_work.active_results[i] = True, None
                         if self.serve_cfg.use_prefix_cache:  # store the results in the prefix cache buffer store
                             sequence = np.array(result.token_list)
-                            cache_entry, _ = self._get_cache_entry(self.decode_work.cache, i)
+                            cache_entry, _ = self._get_decode_cache_entry(self.decode_work.cache, i)
                             ns = math.ceil(sequence.size / self.serve_cfg.prefix_chunk_size)
                             buffer_ids = BUFFER_STORE._get_unique_buffer_ids(ns)
                             visited_ids, store_ids, del_ids = self._insert_prefix(sequence, buffer_ids)
@@ -700,8 +720,6 @@ class ServingLoop:
             inputs = np.pad(inputs, ((0, row_pad), (0, col_pad)), mode="constant", constant_values=self.pad_id)
 
             with set_mesh(self.prefill_mesh):
-                #actual_cache_len = np.array(max(job.match_len for job in prefill_input), dtype=np.int32)
-                #self.prefill_cache.iter = actual_cache_len  # TODO: make this explictly cache public interface
                 kvs = [job.cache_entry() if job.cache_entry is not None else None for job in prefill_input]
                 batch_idxs = np.array([i for i, kv in enumerate(kvs) if kv is not None])
                 actual_lens = np.array([job.match_len for kv, job in zip(kvs, prefill_input) if kv is not None])
@@ -710,19 +728,16 @@ class ServingLoop:
                 # sort to minimize variants num
                 length_sort = sorted(range(len(kvs)), key=lambda i: jax.tree.leaves(kvs[i])[0].shape[-2])
                 sorted_args = [[x[i] for i in length_sort] for x in (kvs, batch_idxs, actual_lens)]
-                insert_sequences = maybe_call(self.prefill_cache.insert_sequences, self.prefill_mesh)
-                self.prefill_cache = insert_sequences(self.prefill_cache, *sorted_args, erase=True)
+                self.prefill_cache = self._prefill_insert_sequences(self.prefill_cache, *sorted_args, erase=True)
 
                 cfg = dataclasses.replace(self.cfg, mesh=self.prefill_mesh)
-                forward_fn = maybe_call(self.forward_fn, self.prefill_mesh)
-                _, self.prefill_cache = forward_fn(inputs, self.prefill_weights, self.prefill_cache, cfg)
+                _, self.prefill_cache = self.prefill_fn(inputs, self.prefill_weights, self.prefill_cache, cfg)
 
             with set_mesh(self.prefill_mesh):
                 for i, job in enumerate(prefill_input):
-                    request = job.request
-                    cache_entry, _ = maybe_call(self._get_cache_entry, self.prefill_mesh)(self.prefill_cache, i)
+                    request, sequence = job.request, np.array(job.request.text)
+                    cache_entry, _ = self._get_prefill_cache_entry(self.prefill_cache, i)
                     cache_entry = _ensure_all_args_on_mesh(cache_entry, self.decode_mesh)
-                    sequence = np.array(request.text)
                     new_decode = PrefillResult(
                         request.id, sequence, request.text[-1], cache_entry, len(request.text) - 1
                     )
@@ -741,10 +756,10 @@ class ServingLoop:
                 cache_entry = partial(_concat, _ensure_all_args_on_mesh(buffers, mesh=self.decode_mesh), _axis)
                 new_decode = PrefillResult(request.id, sequence, request.text[-1], cache_entry, len(request.text) - 1)
                 self.prefill_work.to_decode.append(new_decode)
-                print(f"Found a full match")
+                INFO(f"Found a full match")
             else:
-                print(f"Need to prefill, only found a match for length {total_match / (len(request.text) - 1):.2%}")
-                print(f"That equals {len(buffer_ids)} buffers or {total_match=}")
+                INFO(f"Need to prefill, only found a match for length {total_match / (len(request.text) - 1):.2%}")
+                INFO(f"That equals {len(buffer_ids)} buffers or {total_match=}")
                 if total_match > 0:
                     cache_entry = partial(_concat, _ensure_all_args_on_mesh(buffers, mesh=self.prefill_mesh), _axis)
                 else:
@@ -759,12 +774,12 @@ class ServingLoop:
         if should_start_profile:
             self.profile_start_time, self.profiling = time.perf_counter(), True
             jax.profiler.start_trace("/tmp/online")
-            print("STARTING TRACE")
+            DEBUG("STARTING TRACE")
         should_stop_profile = self.profile_start_time > 0 and time.perf_counter() - self.profile_start_time > 5.0
         should_stop_profile = SyncServer.broadcast("stop_profile", self._it, should_stop_profile, is_source=is_server)
         if should_stop_profile:
             self.profile_start_time, self.profiling = -1, False
-            print("STOPPING TRACE")
+            DEBUG("STOPPING TRACE")
             jax.profiler.stop_trace()
         # potentially profile when received the request to #########################################
 
@@ -787,6 +802,7 @@ class ServingLoop:
         # main event loop work #####################################################################
         self.decode_step()
         self.prefill_step()
+        [handler.flush() for handler in logger.handlers]
         # main event loop work #####################################################################
 
         # offload buffers to keep a max of N #######################################################
@@ -796,7 +812,7 @@ class ServingLoop:
             refs_to_delete = sorted(BUFFER_STORE.usecount.keys())[:extra_buffer_count]
             deleted_buffers = remove_prefix_nodes(self.prefix_cache, refs_to_delete)
             BUFFER_STORE.delete(list(deleted_buffers))
-            if len(BUFFER_STORE._store) > self.serve_cfg.max_buffers:
+            if len(BUFFER_STORE._store) > self.serve_cfg.max_buffers:  # DEBUG
                 raise ValueError()
         # offload buffers to keep a max of N #######################################################
 
@@ -808,7 +824,18 @@ class ServingLoop:
         with self.state_lock:
             self.serve_cfg = dataclasses.replace(self.serve_cfg, **params)
 
-    def new_prefix_cache(self):
-        self.prefix_cache = TrieNode(None, lock=threading.Lock())
-        self._retrieve_prefix = partial(retrieve_prefix, self.prefix_cache, chunk_size=self.serve_cfg.prefix_chunk_size)
-        self._insert_prefix = partial(insert_prefix, self.prefix_cache, chunk_size=self.serve_cfg.prefix_chunk_size)
+    def serve_forever(self, shutdown_signal: threading.Event):
+        def serve_thread():
+            try:
+                while not shutdown_signal.is_set():
+                    self.serving_step()
+            except Exception as e:
+                WARN(traceback.format_exc())
+                WARN(f"Exception {e}")
+            finally:
+                shutdown_signal.set()
+                INFO("Received a shutdown signal")
+            INFO("Exiting the serving loop")
+
+        serving_thread = threading.Thread(target=serve_thread)
+        serving_thread.start()

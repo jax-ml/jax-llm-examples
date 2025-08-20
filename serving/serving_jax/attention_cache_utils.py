@@ -15,12 +15,21 @@
 import dataclasses
 import math
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import auto_axes
 
 QuantArray, PyTree, KVCache, PagedKVCache = Any, Any, Any, Any
+
+
+@dataclasses.dataclass
+class AttentionInterface:
+    cache: KVCache
+    get_sequence: Callable
+    insert_sequences: Callable
+
 
 next_power_of_2 = lambda x: 2 ** math.ceil(math.log2(max(x, 1)))
 _pad_after = lambda x, l, axis: jnp.pad(x, [(0, 0) if i != axis else (0, l - x.shape[i]) for i in range(x.ndim)])
@@ -47,7 +56,7 @@ def _transpose_attention_tree(kv_list: list[PyTree], time_axis: int):
 
 
 @partial(jax.jit, donate_argnames=("cache",))
-def _kvcache_insert_sequences(
+def __kvcache_insert_sequences(
     cache: KVCache,
     kvs: list[tuple[jax.Array | QuantArray, ...]],
     batch_idxs: list[jax.Array],
@@ -67,20 +76,32 @@ def _kvcache_insert_sequences(
 
     def _update_element(x, u):
         update_permute = [0, cache.time_axis] + [i for i in range(u.ndim) if i not in (0, cache.time_axis)]
-        # time_dim, batch_dim = update_permute.pop(cache.time_axis), update_permute.pop(0)  # first pop time_axis
-        # update_permute = [batch_dim, time_dim] + update_permute
-        return x.at[batch_idxs[:, None], :, time_indices, ...].set(
-            u.transpose(update_permute), mode="drop", out_sharding=jax.typeof(x).sharding
-        )
+        return x.at[batch_idxs[:, None], :, time_indices, ...].set(u.transpose(update_permute), mode="drop")
 
+    buffers_sharding = jax.tree.map(lambda x: jax.typeof(x).sharding, cache.buffers)
     cache_kvs = jax.tree.map(_update_element, cache.buffers, kvs)
-    cache_starts = cache.starts.at[batch_idxs].set(
-        start_time, mode="drop", out_sharding=jax.typeof(cache.starts).sharding
-    )
+    cache_starts = cache.starts.at[batch_idxs].set(start_time, mode="drop")
     cache_iter = jnp.where(uninitialized_cache, jnp.max(actual_lens), cache.iter)
 
     buffer_names = [field.name for field in dataclasses.fields(cache)][: len(cache_kvs)]
-    return dataclasses.replace(cache, **dict(zip(buffer_names, cache_kvs, strict=True)), iter=cache_iter, starts=cache_starts)
+    return dataclasses.replace(
+        cache, **dict(zip(buffer_names, cache_kvs, strict=True)), iter=cache_iter, starts=cache_starts
+    )
+
+
+@partial(jax.jit, donate_argnames=("cache",))
+def _kvcache_insert_sequences(
+    cache: KVCache,
+    kvs: list[tuple[jax.Array | QuantArray, ...]],
+    batch_idxs: list[jax.Array],
+    actual_lens: list[jax.Array],
+    update_mask: list[bool] | None = None,
+    erase: bool = False,
+):
+    cache_shardings = jax.tree.map(lambda x: jax.typeof(x).sharding, cache)
+    return auto_axes(__kvcache_insert_sequences, out_sharding=cache_shardings)(
+        cache, kvs, batch_idxs, actual_lens, update_mask, erase
+    )
 
 
 @partial(jax.jit, donate_argnames=("cache",))
@@ -133,7 +154,7 @@ def _find_empty_pages(free_pages: jax.Array, k: int, proposal_pages: jax.Array |
 
 
 @partial(jax.jit, donate_argnames=("cache",))
-def _paged_kvcache_insert_sequences(
+def __paged_kvcache_insert_sequences(
     cache: PagedKVCache,
     kvs: list[tuple[jax.Array | QuantArray, ...]],
     batch_idxs: list[jax.Array],
@@ -186,6 +207,20 @@ def _paged_kvcache_insert_sequences(
     )
 
 
+@partial(jax.jit, donate_argnames=("cache",))
+def _paged_kvcache_insert_sequences(
+    cache: PagedKVCache,
+    kvs: list[tuple[jax.Array | QuantArray, ...]],
+    batch_idxs: list[jax.Array],
+    actual_lens: list[jax.Array],
+    update_mask: list[bool] | None = None,
+) -> PagedKVCache:
+    cache_sharding = jax.tree.map(lambda x: jax.typeof(x).sharding, cache)
+    return auto_axes(__paged_kvcache_insert_sequences, out_sharding=cache_sharding)(
+        cache, kvs, batch_idxs, actual_lens, update_mask
+    )
+
+
 def paged_kvcache_insert_sequences(
     cache: KVCache,
     kvs: list[tuple[jax.Array | QuantArray, ...]],
@@ -194,6 +229,8 @@ def paged_kvcache_insert_sequences(
     erase: bool = False,
 ):
     del erase  # inapplicable
+    if len(kvs) == 0:
+        return cache
     pad_len = max(next_power_of_2(len(kvs)), 4) - len(kvs)  # an update of power of 2 and at least 4
     update_mask = [i < len(kvs) for i in range(len(kvs) + pad_len)]
     kvs = kvs + [kvs[-1]] * pad_len

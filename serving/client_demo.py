@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import List
+from argparse import ArgumentParser
 
 import numpy as np
 import requests
@@ -26,7 +27,7 @@ def fetch_stream(request_id: int, prompt_text: str):
     """
     payload = {"id": request_id, "text": prompt_text}
     headers = {"accept": "application/json", "Content-Type": "application/json"}
-    global responses, responses_lock, responses_done
+    global responses, responses_lock, responses_done, SERVER_URL
 
     try:
         t_first, t_start = None, time.perf_counter()
@@ -94,39 +95,55 @@ def generate_layout() -> Layout:
 
 def profile_issue():
     headers = {"accept": "application/json", "Content-Type": "application/json"}
+    global SERVER_URL
     server_url = SERVER_URL + "/profile"
     requests.get(server_url, headers=headers)
 
 
 def set_generation_length(length: int):
+    global SERVER_URL
     headers = {"accept": "application/json", "Content-Type": "application/json"}
     server_url = SERVER_URL + "/set_generation_length"
     requests.get(server_url, headers=headers, params={"length": length})
 
 
 def retrieve(id: int):
+    global SERVER_URL
     headers = {"accept": "application/json", "Content-Type": "application/json"}
     server_url = SERVER_URL + "/retrieve"
     print(requests.get(server_url, headers=headers, params={"id": id}))
 
 
 def investigate(id: int):
+    global SERVER_URL
     headers = {"accept": "application/json", "Content-Type": "application/json"}
     server_url = SERVER_URL + "/investigate"
     requests.get(server_url, headers=headers, params={"id": id})
 
 
 def main():
-    global responses, MAX_PANEL_LINES, responses_lock, responses_done
+    global responses, MAX_PANEL_LINES, responses_lock, responses_done, SERVER_URL
     all_prompts = get_prompts()
-    prompts_num = 18
-    idxs = np.random.randint(0, len(all_prompts), prompts_num)
-    PROMPTS = [all_prompts[idx] for idx in idxs]
 
     # This controls the "scrolling" effect. It's the max number of lines
     # displayed in a panel. When text exceeds this, only the latest lines are shown.
     MAX_PANEL_LINES = 15
     # ---------------------
+
+    parser = ArgumentParser()
+    parser.add_argument("--profile", action="store_true", default=False)
+    parser.add_argument("--decode-length", "-d", default=32, type=int)
+    parser.add_argument("--query-num", "-q", default=18, type=int)
+    parser.add_argument("--port", "-p", default=8081, type=int)
+
+    args = parser.parse_args()
+    SERVER_URL = f"http://localhost:{args.port}"
+    idxs = np.random.randint(0, len(all_prompts), args.query_num)
+    PROMPTS = [all_prompts[idx] for idx in idxs]
+
+    if args.profile:
+        profile_issue()
+        return
 
     # A thread-safe dictionary to store the state of each streaming response.
     # The structure will be: { request_id: {"prompt": str, "response": str, "status": str} }
@@ -138,15 +155,7 @@ def main():
     responses_lock = threading.Lock()
     console = Console()
 
-    if len(sys.argv) > 1 and sys.argv[1] == "profile":
-        profile_issue()
-        return
-
-    if len(sys.argv) > 2 and sys.argv[1] == "investigate":
-        investigate(int(sys.argv[2]))
-        return
-
-    set_generation_length(64 if len(sys.argv) <= 1 else int(sys.argv[1]))
+    set_generation_length(args.decode_length)
     threads = []
     console.print("[bold cyan]Starting streaming requests... Press Ctrl+C to exit.[/]")
     time.sleep(1)  # Give user time to read the message

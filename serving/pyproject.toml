@@ -13,10 +13,26 @@ dependencies = [
     "jax",
     "tqdm",
     "numpy",
-    #"orbax-checkpoint",
-    #"datasets",
     "gcsfs",
     "etils",
+]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W291",  # trailing whitespace
+    "F821",  # undefined variables
+]
+ignore = [
+    "E731",  # lambdas expression instead of def
+    "E741",  # allow 'l' as a variable name
+    "E402",  # allow module imports not at top of file
+    "F841",  # allow unused variables
+    "E501",  # ignore line-too-long
 ]
 
 [build-system]

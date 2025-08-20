@@ -13,4 +13,4 @@
 # limitations under the License.
 
 from .http_server import run_http_server
-from .serving_loop import DecodeResult, ServingConfig, ServingLoop, UserRequestPrompt
+from .serving_loop import DecodeResult, ServingConfig, ServingLoop, UserRequestPrompt, AttentionWrapper

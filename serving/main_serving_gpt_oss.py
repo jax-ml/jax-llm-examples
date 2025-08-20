@@ -13,31 +13,39 @@
 # limitations under the License.
 
 import dataclasses
+import socket
 import threading
 from argparse import ArgumentParser
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import serving_jax as serving
+from gpt_oss_jax import model as gpt_jax
 from jax import random
 from jax.sharding import AxisType
-from jax.sharding import PartitionSpec as P
-from serving_jax import attention_cache_utils
+from serving_jax import attention_cache_utils as attn_utils
 
-from deepseek_r1_jax import chkpt_utils as dsjax_utils
-from deepseek_r1_jax import model as dsjax
-
+Config = Any
 
 jax.config.update("jax_explain_cache_misses", True)
 # jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
 # jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
 # jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
 
+try:  # newer JAX only
+    my_id = int(socket.gethostname().split("-")[-1])
+    my_ip = socket.getaddrinfo(socket.gethostname(), 80)[0][-1][0]
+    jax.config.update("jax_cross_host_transfer_socket_address", f"{my_ip}:{17007 + my_id}")
+    jax.config.update("jax_cross_host_transport_addresses", ",".join([f"{my_ip}:0"] * 8))
+except:  # noqa: E722
+    pass
 
-def encode_input(tokenizer, texts, pad_id: int = 0):
+
+def encode_input(tokenizer, texts, pad_id: int = gpt_jax.PAD_ID):
     assert isinstance(texts, list)
     inputs = [
         tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True) for text in texts
@@ -60,7 +68,7 @@ def distributed_init():
     # jax.distributed.initialize()
 
 
-def load_model():
+def main():
     parser = ArgumentParser()
     parser.add_argument("--server", action="store_true", help="Make this node the main server.", default=False)
     ARGS = parser.parse_args()
@@ -68,36 +76,50 @@ def load_model():
     distributed_init()
     devices = jax.devices()  # this helps catch distributed errors quickly
 
-    ckpt_path = Path(f"~/bucket/deepseek-r1-jax-chkpt").expanduser()
-    tokenizer = dsjax.load_tokenizer()
+    model_name = "gpt_oss_20b-quant"
+    ckpt_path = Path(f"~/bucket/gpt_oss_jax/{model_name}").expanduser()
+    cfg = gpt_jax.load_config(ckpt_path / "config.json")
+    tokenizer = gpt_jax.load_tokenizer(ckpt_path)
     assert ckpt_path.is_dir()
     print("---> Model config loaded")
 
-    mesh = jax.make_mesh((1, 8, len(devices) // 8), P("x", "y", "z"), devices=devices, axis_types=(AxisType.Auto,) * 3)
-    cfg = dataclasses.replace(dsjax.Config(), max_seq_len=1024, mesh=mesh)#, num_layers=4)
-    weights = dsjax_utils.load_model(ckpt_path, cfg)
-    decode_weights, prefill_weights = weights, weights
+    # two hosts, different device and host meshes
+    decode_mesh = jax.make_mesh((1, 2, 2), ("x", "y", "z"), devices=devices, axis_types=(AxisType.Explicit,) * 3)
+    prefill_mesh = jax.make_mesh((1, 2, 2), ("x", "y", "z"), devices=devices, axis_types=(AxisType.Explicit,) * 3)
+    cfg = dataclasses.replace(cfg, mesh=decode_mesh, quant_moe=True, quant_cache=True)
+    cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=False, use_decode_attn_kernel=False, max_seq_len=2048)
+    cfg.quant_cache = True
+
+    weights_formats, decode_cache_formats = gpt_jax.optimal_formats(dataclasses.replace(cfg, mesh=decode_mesh))
+    decode_weights = gpt_jax.load_pytree(ckpt_path, weights_formats)
+    weights_formats, prefill_cache_formats = gpt_jax.optimal_formats(dataclasses.replace(cfg, mesh=prefill_mesh))
+    # prefill_weights = gpt_jax.load_pytree(ckpt_path, weights_formats)
+    prefill_weights = decode_weights
 
     print("---> Weights loaded")
-    serve_cfg = serving.ServingConfig(
-        decode_steps=32, max_decode_length=64, decode_batch_size=8, prefill_batch_size=1, prefix_chunk_size=64, max_ondevice_buffers=16
-    )
+
+    serve_cfg = serving.ServingConfig(decode_steps=32, max_decode_length=64, prefix_chunk_size=64)
+    decode_cache = gpt_jax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, cfg.max_seq_len)
+    decode_cache = jax.tree.map(lambda x, sds: jax.device_put(x, sds.sharding), decode_cache, decode_cache_formats)
     decode_cache = serving.AttentionWrapper(
-        dsjax.KVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, cfg.max_seq_len),
-        attention_cache_utils.kvcache_get_sequence,
-        attention_cache_utils.kvcache_insert_sequences
+        decode_cache, attn_utils.kvcache_get_sequence, attn_utils.kvcache_insert_sequences
     )
+    # decode_cache = gpt_jax.PagedKVCache.init(random.key(0), cfg, serve_cfg.decode_batch_size, 2048, 32)
+    # decode_cache = serving.AttentionWrapper(
+    #     decode_cache, attn_utils.paged_kvcache_get_sequence, attn_utils.paged_kvcache_insert_sequences
+    # )
+
+    prefill_cache = gpt_jax.KVCache.init(random.key(0), dataclasses.replace(cfg, mesh=prefill_mesh), serve_cfg.prefill_batch_size, 2048)
+    prefill_cache = jax.tree.map(lambda x, sds: jax.device_put(x, sds.sharding), prefill_cache, prefill_cache_formats)
     prefill_cache = serving.AttentionWrapper(
-        dsjax.KVCache.init(random.key(0), cfg, serve_cfg.prefill_batch_size, cfg.max_seq_len),
-        attention_cache_utils.kvcache_get_sequence,
-        attention_cache_utils.kvcache_insert_sequences
+        prefill_cache, attn_utils.kvcache_get_sequence, attn_utils.kvcache_insert_sequences
     )
 
     sampler = partial(jnp.argmax, axis=-1)
 
     @partial(jax.jit, donate_argnames=("cache",))
     def forward_fn(inputs, weights, cache, cfg):
-        logits, cache = dsjax.forward(inputs, (inputs != dsjax.PAD_ID).astype(np.int32), weights, cfg, cache)
+        logits, cache = gpt_jax.forward(inputs, (inputs != gpt_jax.PAD_ID).astype(jnp.int32), weights, cfg, cache)
         return sampler(logits), cache
 
     serve_loop = serving.ServingLoop(
@@ -116,8 +138,10 @@ def load_model():
         shutdown_signal=shutdown_signal,
     )
 
+    return
+
 
 if __name__ == "__main__":
-    load_model()
+    main()
 
 ########################################################################################################################

@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import asyncio
+import signal
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Callable
+from typing import AsyncGenerator, Callable
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -38,12 +39,27 @@ def run_http_server(
     is_server: bool = False,
     shutdown_signal: threading.Event | None = None,
 ) -> None:
+    # lifetime management
+    def signal_listener():
+        while not shutdown_signal.is_set():
+            time.sleep(1)
+        signal.raise_signal(signal.SIGKILL)
+
+    threading.Thread(target=signal_listener).start()
+
+    def interrupt_handler(signum, frame):
+        if shutdown_signal is not None:
+            shutdown_signal.set()
+
+    signal.signal(signal.SIGINT, interrupt_handler)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
         if shutdown_signal is not None:
             shutdown_signal.set()
 
+    # the HTTP server
     APP = FastAPI(lifespan=lifespan)
 
     async def generate_generator(id: int, text: str, request: Request) -> AsyncGenerator[str, None]:
@@ -107,9 +123,5 @@ def run_http_server(
     if is_server:
         uvicorn.run(APP, host="0.0.0.0", port=8081, reload=False, server_header=False)
     else:
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            if shutdown_signal is not None:
-                shutdown_signal.set()
+        while not shutdown_signal.is_set():
+            time.sleep(0.1)
