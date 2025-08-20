@@ -10,6 +10,7 @@ Current contents include:
 * [Llama 3](llama3/)
 * [Qwen 3](qwen3/)
 * [Kimi K2](kimi_k2/)
+* [OpenAI GPT OSS](gpt_oss/)
 
 ---
 
