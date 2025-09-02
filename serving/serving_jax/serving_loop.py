@@ -509,6 +509,7 @@ like_shard = lambda z, mesh: jax.tree.map(lambda x: NamedSharding(mesh, jax.type
 _make_empty = lambda x, mesh: jax.make_array_from_single_device_arrays(
     x.shape, NamedSharding(mesh, jax.typeof(x).sharding.spec), [], dtype=x.dtype
 )
+which_platform = lambda cfg: cfg.mesh.devices.reshape(-1)[0].platform
 
 
 def maybe_call(fn: Callable, mesh: Mesh):
@@ -752,6 +753,9 @@ class ServingLoop:
             BUFFER_STORE.mark_visited(visited_ids)
             _axis = self.serve_cfg.time_axis - 1 + 1  # batch missing (-1) layers concatenated (+1)
             buffers = BUFFER_STORE.load(buffer_ids)
+            if which_platform(self.prefill_mesh) == "tpu" and total_match == sequence.size:
+                # skip full match on TPU, temporary workaround to ensure buffer consistency
+                total_match = max(sequence.size - 1, 0)
             if total_match == sequence.size:
                 cache_entry = partial(_concat, _ensure_all_args_on_mesh(buffers, mesh=self.decode_mesh), _axis)
                 new_decode = PrefillResult(request.id, sequence, request.text[-1], cache_entry, len(request.text) - 1)
