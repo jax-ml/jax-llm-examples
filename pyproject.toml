@@ -1,3 +1,131 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax-llm-examples"
+version = "0.1.0"
+description = "A collection of JAX implementations for various Large Language Models."
+requires-python = ">=3.10"
+readme = "README.md"
+license = { file = "LICENSE" }
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  "jax",
+  "jaxlib",
+  "numpy",
+  "transformers",
+]
+
+[project.optional-dependencies]
+deepseek_r1 = [
+    "etils",
+    "ipykernel",
+    "orbax-checkpoint",
+    "torch",
+    "torchvision>=0.21.0",
+    "tpu-info",
+    "tqdm",
+    "transformers>=4.49.0",
+]
+gpt_oss = [
+    "absl-py",
+    "datasets",
+    "etils",
+    "flatbuffers",
+    "gcsfs",
+    "tensorstore",
+    "torch",
+    "tqdm",
+]
+kimi_k2 = [
+    "etils",
+    "ipykernel",
+    "orbax-checkpoint",
+    "torch",
+    "torchvision>=0.21.0",
+    "tpu-info",
+    "tqdm",
+    "transformers>=4.49.0",
+]
+llama3 = [
+    "datasets",
+    "etils",
+    "gcsfs",
+    "orbax-checkpoint",
+    "torch",
+    "tqdm",
+]
+llama4 = [
+    "datasets",
+    "etils",
+    "gcsfs",
+    "orbax-checkpoint",
+    "torch",
+    "tqdm",
+]
+# qwen3 has the same dependencies as llama3
+qwen3 = [
+    "datasets",
+    "etils",
+    "gcsfs",
+    "orbax-checkpoint",
+    "torch",
+    "tqdm",
+]
+
+# A convenience extra to install dependencies for all models.
+all = [
+    "jax-llm-examples[cli]",
+    "jax-llm-examples[deepseek_r1]",
+    "jax-llm-examples[gpt_oss]",
+    "jax-llm-examples[kimi_k2]",
+    "jax-llm-examples[llama3]",
+    "jax-llm-examples[llama4]",
+    "jax-llm-examples[qwen3]",
+]
+
+# Setuptools configuration to handle the monorepo structure
+[tool.setuptools]
+# Explicitly list all packages and their subpackages to be included in the distribution.
+# Assumes source code is in the directories specified in `package_dir`.
+packages = [
+    "deepseek_r1_jax",
+    "deepseek_r1_jax.third_party",
+    "deepseek_r1_jax.third_party.tokenizer",
+    "gpt_oss_jax",
+    "jax_llm_examples.cli",
+    "kimi_k2_jax",
+    "kimi_k2_jax.third_party",
+    "llama3_jax",
+    "llama4_jax",
+    "qwen3_jax",
+]
+
+[tool.setuptools.package-dir]
+# Map the Python package names to their actual directories on disk.
+deepseek_r1_jax = "deepseek_r1_jax/deepseek_r1_jax"
+gpt_oss_jax = "gpt_oss/gpt_oss_jax"
+kimi_k2_jax = "kimi_k2/kimi_k2_jax"
+llama3_jax = "llama3/llama3_jax"
+llama4_jax = "llama4/llama4_jax"
+qwen3_jax = "qwen3/qwen3_jax"
+
+[tool.setuptools.package-data]
+# Include necessary non-python files (configs, tokenizers, etc.) for specific packages
+"deepseek_r1_jax.third_party" = ["*.json"]
+"deepseek_r1_jax.third_party.tokenizer" = ["*.gz", "*.json"]
+"kimi_k2_jax.third_party" = ["*.json"]
+
 [tool.black]
 line-length = 120
 
