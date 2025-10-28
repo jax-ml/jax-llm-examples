@@ -207,6 +207,12 @@ def convert_model_or_layer(
     }
     new_params = {k: None for k in layer_params.keys()}
 
+    # some qwen3 checkpoints store both 'embed_tokens' and 'lm_head' even if the embeddings are tied
+    # in this case, we check that the weights are identical and delete 'lm_head'
+    if cfg.tie_embed and 'lm_head.weight' in torch_params:
+        torch.testing.assert_close(torch_params['lm_head.weight'], torch_params['model.embed_tokens.weight'])
+        del torch_params['lm_head.weight']
+
     def convert_weight_thread(tkey, tweight):
         with jax.default_device(device):
             jweight = convert_weight(tkey, _map_weight(tkey, tweight, custom_transform_map=custom_transform_map), cfg)
