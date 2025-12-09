@@ -21,9 +21,9 @@ def main(model_path: str | Path, ckpt_path: str | Path):
     from safetensors import safe_open
     from tqdm import tqdm
 
-    model_path, ckpt_path = Path(model_path).expanduser(), Path(ckpt_path).expanduser()
+    model_path, ckpt_path = Path(model_path).expanduser().resolve(), Path(ckpt_path).expanduser().resolve()
     files = list(model_path.glob("**/*safetensors"))
-    assert len(files) > 1
+    assert len(files) >= 1
     config_files = list(model_path.glob("**/config.json"))
     assert len(config_files) == 1, "Must have only one `config.json` file in the model path"
     config = AutoConfig.from_pretrained(config_files[0])
