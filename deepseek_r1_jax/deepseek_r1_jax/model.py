@@ -67,8 +67,8 @@ class ShardingRules:
     and sharding contraints.
     """
 
-    batch: AxisName = BATCH_AXIS_NAME
-    sequence: AxisName = None
+    batch: AxisName = None
+    sequence: AxisName = BATCH_AXIS_NAME
     head_dim: AxisName = None
     vocab_in: AxisName = None
     vocab_out: AxisName = TENSOR_AXIS_NAME
@@ -124,18 +124,18 @@ def jax_pytree_struct(cls, meta_fields: tuple = ()):
     data_fields = tuple(f for f in all_fields if f not in meta_fields)
     return tree_util.register_dataclass(cls, data_fields=data_fields, meta_fields=meta_fields)
 
-
+# To support NVL72, embed, num_heads, vocab_size, num_experts were updated.
 @tree_util.register_static
 @dataclasses.dataclass
 class Config:
-    embed: int = 7168
+    embed: int = 8064
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512
-    num_heads: int = 128
+    num_heads: int = 144
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
-    vocab_size: int = 129280
+    vocab_size: int = 145440
     num_layers: int = 61
     max_seq_len: int = 8192
     causal: bool = True
@@ -331,12 +331,27 @@ def quantize(x: jax.Array | ArrayInfo, axis: int | tuple[int, ...], scale_dtype=
     raise ValueError(f"quantize got unexpected type: {type(x)}")
 
 
-def quantize_update_slice(x: QuantArray, y: jax.Array, pos: int, update_axis: int, quant_axis: int):
-    assert x.quant.ndim == y.ndim
-    quant_axis, update_axis = quant_axis % x.quant.ndim, update_axis % x.quant.ndim  # normalize axis numbers
-    # y_quant, y_scale = quantize(y, axis=quant_axis, scale_dtype=x.scale.dtype)  # quantize rhs
+
+def quantize_update_slice(x: QuantArray, y: QuantArray, pos: int, update_axis: int, quant_axis: int):
+    """Update a QuantArray cache slice with a QuantArray value.
+    
+    Args:
+        x: The QuantArray cache to update
+        y: The QuantArray value to write (must already be quantized)
+        pos: Position to update
+        update_axis: Axis along which to update
+        quant_axis: Axis along which quantization was performed
+    """
     y_quant, y_scale = y.quant, y.scale
-    scale_update_axis = [ax for ax in range(x.quant.ndim) if ax != quant_axis][update_axis]  # update axis in `scale`
+    assert x.quant.ndim == y_quant.ndim
+    # Normalize quant_axis (defaults to -1, needs to be positive)
+    quant_axis = quant_axis % x.quant.ndim
+    # update_axis is always 2 (time_axis), so normalization is not strictly needed but harmless
+    update_axis = update_axis % x.quant.ndim
+    # Calculate scale_update_axis: scale array has one fewer dimension (quantized axis removed)
+    # The scale axis corresponding to update_axis in quant is the same if update_axis < quant_axis,
+    # or one less if update_axis > quant_axis
+    scale_update_axis = update_axis if update_axis < quant_axis else update_axis - 1
     z_quant = jax.lax.dynamic_update_slice_in_dim(x.quant, y_quant.astype(x.quant.dtype), pos, axis=update_axis)
     z_scale = jax.lax.dynamic_update_slice_in_dim(x.scale, y_scale.astype(x.scale.dtype), pos, axis=scale_update_axis)
     return z_quant, z_scale
@@ -629,19 +644,47 @@ def einsum(subscripts: str, lhs: jax.Array, rhs: jax.Array | QuantArray):
     if is_type(rhs, QuantArray):
         scale = jnp.expand_dims(rhs.scale, rhs.scale_expand_dims)
         if rhs.out_scaling:
-            return jnp.einsum(subscripts, lhs, rhs.quant) * scale
+            einsum_result = jnp.einsum(subscripts, lhs, rhs.quant)
+            result = einsum_result * scale
+            return result
         else:
-            return jnp.einsum(subscripts, lhs * scale, rhs.quant)
+            lhs_scaled = lhs * scale
+            result = jnp.einsum(subscripts, lhs_scaled, rhs.quant)
+            return result
     else:
         return jnp.einsum(subscripts, lhs, rhs)
 
 
-def update_slice(x: jax.Array | QuantArray, y: jax.Array, pos: int, update_axis: int, quant_axis: int = -1):
-    """dynamic_update_slice wrapper that handles regular arrays and QuantArrays"""
+def update_slice(x: jax.Array | QuantArray, y: jax.Array | QuantArray, pos: int, update_axis: int, quant_axis: int = -1):
+    """dynamic_update_slice wrapper that handles regular arrays and QuantArrays.
+    
+    Args:
+        x: Destination array (can be jax.Array or QuantArray)
+        y: Source array (can be jax.Array or QuantArray)
+        pos: Position to update
+        update_axis: Axis along which to update
+        quant_axis: Axis along which quantization was performed (only used when x is QuantArray)
+    
+    Returns:
+        Updated array with same type as x
+    """
     if is_type(x, QuantArray):
+        # x is QuantArray: y must also be QuantArray (enforced by quantize_cache logic)
+        if not is_type(y, QuantArray):
+            raise TypeError(f"update_slice: when x is QuantArray, y must also be QuantArray, got {type(y)}")
         new_quant, new_scale = quantize_update_slice(x, y, pos, update_axis=update_axis, quant_axis=quant_axis)
         return dataclasses.replace(x, quant=new_quant, scale=new_scale)
+    elif is_type(y, QuantArray):
+        # x is regular array but y is QuantArray: dequantize y first
+        # This case shouldn't happen in practice (cache should match y type), but handle it for safety
+        # Dequantize: quant * scale (using scale's dtype for consistency with quantization)
+        # Note: scale_expand_dims is for einsum operations, but for dequantization we need to restore
+        # the dimension that was removed during quantization (axis -1), so expand at -1
+        scale = jnp.expand_dims(y.scale, -1)  # Expand at -1 to restore quantized dimension
+        y_dequant = y.quant.astype(scale.dtype) * scale
+        return jax.lax.dynamic_update_slice_in_dim(x, y_dequant.astype(x.dtype), pos, axis=update_axis)
     else:
+        # Both are regular arrays
         return jax.lax.dynamic_update_slice_in_dim(x, y.astype(x.dtype), pos, axis=update_axis)
 
 
@@ -772,14 +815,15 @@ def attention(
     # qk = qk + einsum("bhtd,bTd->bhtT", q_pe, k_pe)
     qk = qk + einsum("bhtd,b1Td->bhtT", q_pe, k_pe)
     qk = qk * scale  # [b, h, t, T]
-
     mask = make_attention_mask(t, T, q_segment_ids, kv_segment_ids, q_offset, kv_offset, cfg.causal)
     qk = jnp.where(mask, qk, -1e30)  # Apply the combined mask
     attn = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
+    attn = attn.astype(cfg.dtype)
 
     # grouped-query attention
     attn_ = attn.reshape((b, h, t, T))
     qkv = einsum("bhtT,bhTd->bhtd", attn_, v).astype(cfg.dtype)
+
     return qkv.reshape((b, h, t, v.shape[-1]))
 
 
@@ -856,7 +900,8 @@ def attention_kernel(
 def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
     """Apply RMS normalization."""
     rms = jnp.sqrt(jnp.mean(jnp.astype(x, jnp.float32) ** 2, axis=-1, keepdims=True) + 1e-6)
-    return jnp.astype(gamma * x / rms, jnp.bfloat16)
+    result = jnp.astype(gamma.astype(jnp.float32) * x.astype(jnp.float32) / rms, x.dtype)
+    return result
 
 
 def mla_attention_block(
@@ -918,7 +963,6 @@ def mla_attention_block(
             lengths = _length_minus_right_padding(kv_segment_ids)
             q_offset, kv_offset = -starts, -starts
             cache_updates = (k_nope, k_pe, v)
-
     # constrain the sharding of intermediates for the attention operation
     lsc = partial(logical_sharding_constraint, mesh=cfg.mesh, rules=cfg.rules)
     spec = ("batch", "act_heads", "sequence", "head_dim")
@@ -955,7 +999,8 @@ def _route_tokens_to_moe_experts(
     weight, bias = lsc(weight, (None, None)), lsc(bias, (None,))
 
     scores = jax.nn.sigmoid(jnp.einsum("Sk,kj->Sj", x, weight).astype(cfg.moe_gate_dtype))
-    scores_with_bias = scores + bias
+
+    scores_with_bias = scores + bias.astype(cfg.moe_gate_dtype)
     group_scores = jnp.sum(
         jax.lax.top_k(scores_with_bias.reshape(scores.shape[:-1] + (cfg.n_group, -1)), 2)[0], axis=-1
     )
@@ -1045,7 +1090,6 @@ def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
 
         sort_idx_ = jnp.argsort(expert_mapped_topk_idx_, axis=-1)  # [b * s * e]
         isort_idx_ = jnp.argsort(sort_idx_)
-
         if cfg.strategy == "prefill":
             truncate_size = round(2 * sort_idx_.size / expert_count)
             sort_idx_, isort_idx_ = sort_idx_[:truncate_size], isort_idx_[:truncate_size]
@@ -1088,7 +1132,7 @@ def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
 
         if cfg.strategy == "prefill":
             with jax.named_scope("expert_weighting"):
-                ff_out = ff_out * topk_weights.reshape(-1)[sort_idx_][..., None]
+                ff_out = ff_out.astype(topk_weights.dtype) * topk_weights.reshape(-1)[sort_idx_][..., None]
             with jax.named_scope("unpermute"):
                 # unpermute tokens
                 dtype = jnp.bfloat16
@@ -1103,11 +1147,12 @@ def moe_block_ep(x: jax.Array, layer: MoELayer, cfg: Config):
                 ).astype(dtype)
                 ff_out_expert = ff_out_expert.astype(cfg.dtype)
         else:
+
             with jax.named_scope("unpermute"):
                 ff_out = jnp.take_along_axis(ff_out, isort_idx_[..., None], axis=-2)
             with jax.named_scope("expert_weighting"):
                 ff_out_expert = jnp.einsum(
-                    "Ted,Te->Td", ff_out.reshape((b * s, e, -1)), topk_weights.reshape((b * s, -1))
+                    "Ted,Te->Td", ff_out.astype(topk_weights.dtype).reshape((b * s, e, -1)), topk_weights.reshape((b * s, -1))
                 )
                 ff_out_expert = ff_out_expert.astype(cfg.dtype)
 
@@ -1165,7 +1210,6 @@ def forward_layer(
     x = jax.lax.with_sharding_constraint(
         x, logical_to_sharding(("batch", "sequence", "act_embed"), cfg.mesh, cfg.rules)
     )
-
     # Attention block
     with jax.named_scope("attn_pre_norm"):
         attn_in = rms_norm(x, layer.gamma_pre_attn)
@@ -1210,7 +1254,7 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     if is_type(cache, KVCache):
         cache.k_nope, cache.k_pe, cache.v = [[z[i] for z in all_cache_updates] for i in range(3)]
         additional_tokens = jnp.max(_length_minus_right_padding(segment_ids))
-        return logits, dataclasses.replace(cache, iter=(jnp.maximum(0, cache.iter) + additional_tokens) % cache.size)
+        return logits, dataclasses.replace(cache, iter=(jnp.maximum(0, cache.iter) + additional_tokens) % cache.size)        
     else:
         return logits, all_cache_updates
 
