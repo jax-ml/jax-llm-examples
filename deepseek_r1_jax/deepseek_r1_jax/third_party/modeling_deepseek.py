@@ -53,7 +53,11 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.utils.import_utils import is_torch_fx_available
+try:
+    from transformers.utils.import_utils import is_torch_fx_available
+except ImportError:
+    is_torch_fx_available = lambda: False
+
 from .configuration_deepseek import DeepseekV3Config
 import torch.distributed as dist
 import numpy as np
@@ -795,7 +799,8 @@ class DeepseekV3Attention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
@@ -926,7 +931,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
 
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
@@ -1424,8 +1430,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         if use_cache:
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+                # past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                past_key_values = DynamicCache(past_key_values)
+            # past_key_values_length = past_key_values.get_usable_length(seq_length)
+            past_key_values_length = past_key_values.get_seq_length(seq_length)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -1494,7 +1502,8 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         next_cache = None
         if use_cache:
             next_cache = (
-                next_decoder_cache.to_legacy_cache()
+                # next_decoder_cache.to_legacy_cache()
+                [(layer.keys, layer.values) for layer in next_decoder_cache.layers]
                 if use_legacy_cache
                 else next_decoder_cache
             )

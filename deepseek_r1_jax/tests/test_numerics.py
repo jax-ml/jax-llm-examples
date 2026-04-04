@@ -22,7 +22,7 @@ import random as pyrandom
 import jax
 from jax import numpy as jnp
 from jax import random
-from jax.sharding import PartitionSpec as P, NamedSharding
+from jax.sharding import PartitionSpec as P, NamedSharding, AxisType
 import numpy as np
 import torch
 
@@ -34,8 +34,9 @@ from deepseek_r1_jax.third_party import modeling_deepseek as deepseek
 from deepseek_r1_jax import model as dsjax
 from deepseek_r1_jax import chkpt_utils as utils
 
-config = deepseek.DeepseekV3Config()
+config = deepseek.DeepseekV3Config(_attn_implementation="eager")
 cfg = utils.convert_config(config)
+cfg.use_decode_ragged_dot_kernel = False
 config_json = json.loads((Path(__file__).parents[1] / "deepseek_r1_jax" / "third_party" / "r1_config.json").read_text())
 config.rope_scaling = config_json["rope_scaling"]
 config.rope_scaling_factor = config_json["rope_scaling"]["factor"]
@@ -51,7 +52,7 @@ def err_fn(x, y, axis=-1):
     return diff / (norm + 1e-9)
 
 
-mesh = jax.make_mesh((1, 2, jax.device_count() // 2), P("x", "y", "z"))
+mesh = jax.make_mesh((1, 2, jax.device_count() // 2), P("x", "y", "z"), axis_types=3 * (AxisType.Auto,))
 cfg = dataclasses.replace(cfg, mesh=mesh, rules=dsjax.ShardingRules())
 cfg = dataclasses.replace(cfg, quantize_mlp=False, quantize_attn=False, quantize_moe=False)
 
@@ -288,8 +289,9 @@ class TestNumerics(parameterized.TestCase):
         keyit = _set_seed(seed)
         model_deepseek = deepseek.DeepseekV3ForCausalLM(config_small)
         model_deepseek.eval()
-        cfg_quant = dataclasses.replace(cfg_small, quantize_attn=True, quantize_moe=True, quantize_mlp=False)
-        weights = utils.convert_model(model_deepseek, cfg_small)
+        cfg = dataclasses.replace(cfg_small, quantize_cache=quantize_cache)
+        cfg_quant = dataclasses.replace(cfg, quantize_attn=True, quantize_moe=True, quantize_mlp=False)
+        weights = utils.convert_model(model_deepseek, cfg)
         weights_quant = dsjax.Weights.quantize(weights, cfg_quant)
         weights = jax.tree.map(jax.device_put, weights, dsjax.Weights.shardings(cfg_small))
         weights_quant = jax.tree.map(jax.device_put, weights_quant, dsjax.Weights.shardings(cfg_quant))
@@ -303,16 +305,16 @@ class TestNumerics(parameterized.TestCase):
 
         if use_cache:
             cache = dsjax.KVCache.init(
-                next(keyit), dataclasses.replace(cfg_small, quantize_cache=quantize_cache), input.shape[0], 32
+                next(keyit), dataclasses.replace(cfg, quantize_cache=quantize_cache), input.shape[0], 32
             )
         else:
             cache = None
 
-        ret1 = jax.jit(dsjax.forward)(input, segment_ids=segment_ids, weights=weights, cfg=cfg_small, cache=cache)
+        ret1 = jax.jit(dsjax.forward)(input, segment_ids=segment_ids, weights=weights, cfg=cfg, cache=cache)
         ret3 = jax.jit(dsjax.forward)(input, segment_ids=segment_ids, weights=weights_quant, cfg=cfg_quant, cache=cache)
 
-        y1 = ret1 if not use_cache else ret1[0]
-        y3 = ret3 if not use_cache else ret3[0]
+        y1, _ = ret1
+        y3, _ = ret3
 
         err = err_fn(y1, y2, axis=-1)
         err_quant = err_fn(y3, y2, axis=-1)

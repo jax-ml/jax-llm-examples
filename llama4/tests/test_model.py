@@ -18,11 +18,7 @@ from absl.testing import absltest, parameterized
 import jax
 from jax import numpy as jnp
 from jax import random
-from jax.sharding import PartitionSpec as P, AxisType, set_mesh
-try:
-    from jax.sharding import use_mesh as set_mesh  # jax < 0.7.0
-except ImportError:
-    pass
+from jax.sharding import AxisType
 
 from llama4_jax import model as l4jax
 
@@ -74,7 +70,7 @@ MAVERICK_CFG = l4jax.Config(
 
 class TestModel(parameterized.TestCase):
     def setUp(self):
-        self.mesh = jax.make_mesh((1, len(jax.devices()), 1), P("x", "y", "z"), axis_types=(AxisType.Explicit,) * 3)
+        self.mesh = jax.make_mesh((1, len(jax.devices()), 1), ("x", "y", "z"), axis_types=(AxisType.Explicit,) * 3)
         self.small_scout_cfg = dataclasses.replace(
             SCOUT_CFG, mesh=self.mesh, num_layers=4, embed=64, moe_num_experts=4, vocab_size=128
         )
@@ -117,6 +113,20 @@ class TestModel(parameterized.TestCase):
         del cache
 
     @parameterized.product(scout=[True, False], quant_weights=[False, True], quant_cache=[True, False])
+    def test_kernel_prefill(self, scout, quant_weights, quant_cache):
+        cfg = self.small_scout_cfg if scout else self.small_maverick_cfg
+        cfg = dataclasses.replace(
+            cfg, quant_attn=quant_weights, quant_mlp=quant_weights, quant_moe=quant_weights, quant_cache=quant_cache
+        )
+        cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=True)
+        tokens = jnp.ones((1, 32), dtype=jnp.int32)
+        weights = l4jax.Weights.init(random.key(0), cfg)
+        cache = l4jax.KVCache.init(random.key(0), cfg, tokens.shape[0], cfg.max_seq_len)
+        with jax.sharding.set_mesh(cfg.mesh):
+            with self.assertRaisesRegex(NotImplementedError, r"Currently, only TPU supports prefill attention.*"):
+                _ = l4jax.prefill(tokens, weights, cache, cfg)
+
+    @parameterized.product(scout=[True, False], quant_weights=[False, True], quant_cache=[True, False])
     def test_prefill_decode(self, scout, quant_weights, quant_cache):
         cfg = self.small_scout_cfg if scout else self.small_maverick_cfg
         cfg = dataclasses.replace(
@@ -125,10 +135,10 @@ class TestModel(parameterized.TestCase):
         tokens = jnp.ones((1, 32), dtype=jnp.int32)
         weights = l4jax.Weights.init(random.key(0), cfg)
         cache = l4jax.KVCache.init(random.key(0), cfg, tokens.shape[0], cfg.max_seq_len)
-        with set_mesh(cfg.mesh):
+        with jax.sharding.set_mesh(cfg.mesh):
             max_tokens, _, cache = l4jax.prefill(tokens, weights, cache, cfg)
         next_tokens = max_tokens[:, :-1]
-        with set_mesh(cfg.mesh):
+        with jax.sharding.set_mesh(cfg.mesh):
             for _ in range(2):
                 next_tokens, cache = l4jax.decode_step(next_tokens, weights, cache, cfg)
 
