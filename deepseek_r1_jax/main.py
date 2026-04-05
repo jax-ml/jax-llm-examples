@@ -31,6 +31,7 @@ def encode_input(tokenizer, texts, pad_id: int = dsjax.PAD_ID):
         tokenizer.apply_chat_template([{"role": "user", "content": text}]) + tokenizer.encode("<|Assistant|><think>")
         for text in texts
     ]
+    inputs = [getattr(text, "input_ids", text) for text in inputs]
     max_len = max([len(x) for x in inputs])
     inputs = [(max_len - len(x)) * [pad_id] + x for x in inputs]
     return np.array(inputs)
@@ -57,7 +58,7 @@ if __name__ == "__main__":
 
     zero_cache = dsjax.KVCache.init(random.key(1), cfg, input.shape[0], cfg.max_seq_len)
     curr_tokens, logits, cache = dsjax.prefill(input, weights, zero_cache, cfg)
-    curr_tokens, tokens_list = curr_tokens[:, cache.length - 1 : cache.length], []
+    curr_tokens, tokens_list = curr_tokens[:, cache.iter - 1 : cache.iter], []
     tokens_list = []
     for _ in range(32):
         tokens_list.append(curr_tokens)

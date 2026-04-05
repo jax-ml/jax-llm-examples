@@ -29,12 +29,13 @@ from gpt_oss_jax import model as gpt_jax
 jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax_cache").expanduser()))
 
 
-def encode_input(tokenizer, texts, pad_id: int = gpt_jax.PAD_ID):
+def encode_input(tokenizer, texts, pad_id: int = gpt_jax.PAD_ID) -> jax.typing.ArrayLike:
     assert isinstance(texts, list)
     inputs = [
         tokenizer.apply_chat_template([{"role": "user", "content": text}], add_bos=True, add_generation_prompt=True)
         for text in texts
     ]
+    inputs = [getattr(text, "input_ids", text) for text in inputs]
     max_len = max([len(x) for x in inputs])
     inputs = [(max_len - len(x)) * [pad_id] + x for x in inputs]
     return np.array(inputs)
@@ -72,7 +73,6 @@ if __name__ == "__main__":
     profile = True
     with set_mesh(cfg.mesh):
         zero_cache = gpt_jax.KVCache.init(random.key(1), cfg, input.shape[0], cfg.max_seq_len)
-        zero_cache = jax.tree.map(lambda x, sds: jax.device_put(x, sds.sharding), zero_cache, cache_formats)
         next_tokens, logits, cache = gpt_jax.prefill(input, weights, zero_cache, cfg)
         curr_tokens = next_tokens.at[:, cache.iter - 1 : cache.iter].get(out_sharding=P(None, None))
         tokens_list = []

@@ -21,10 +21,6 @@ import jax
 from jax import numpy as jnp
 from jax import random
 from jax.sharding import set_mesh, AxisType, PartitionSpec as P
-try:
-    from jax.sharding import use_mesh as set_mesh
-except ImportError:
-    pass
 import numpy as np
 
 from llama4_jax import model as l4jax
@@ -32,11 +28,12 @@ from llama4_jax import model as l4jax
 
 def encode_input(tokenizer, texts, pad_id: int = l4jax.PAD_ID):
     assert isinstance(texts, list)
+    inputs = [tokenizer.apply_chat_template([{"role": "user", "content": text}]) for text in texts]
     inputs = [
-        tokenizer.apply_chat_template([{"role": "user", "content": text}])
-        + tokenizer.encode("<|header_start|>assistant<|header_end|>")
-        for text in texts
+        getattr(input, "input_ids", input) + tokenizer.encode("<|header_start|>assistant<|header_end|>")
+        for input in inputs
     ]
+    inputs = [getattr(text, "input_ids", text) for text in inputs]
     max_len = max([len(x) for x in inputs])
     inputs = [(max_len - len(x)) * [pad_id] + x for x in inputs]
     return np.array(inputs)
@@ -46,13 +43,13 @@ if __name__ == "__main__":
     jax.distributed.initialize()
     quant = True
 
-    ckpt_path = epath.Path("~/bucket/Llama-4-Scout-Instruct").expanduser()
+    ckpt_path = epath.Path("~/bucket/llama4_jax/Llama-4-Scout").expanduser()
     if quant:
         ckpt_path = ckpt_path.parent / f"{ckpt_path.name}-quant"
     tokenizer = l4jax.load_tokenizer(ckpt_path / "tokenizer.json", ckpt_path / "tokenizer_config.json")
 
     mesh = jax.make_mesh(
-        (1, 8, jax.device_count() // 8), ("x", "y", "z"), devices=jax.devices(), axis_types=(AxisType.Explicit,) * 3
+        (1, 4, jax.device_count() // 4), ("x", "y", "z"), devices=jax.devices(), axis_types=(AxisType.Explicit,) * 3
     )
     cfg = l4jax.hf_to_jax_config(json.loads((ckpt_path / "config.json").read_text())["text_config"])
     cfg = dataclasses.replace(cfg, mesh=mesh, quant_attn=quant, quant_moe=quant, quant_mlp=quant)
@@ -67,10 +64,10 @@ if __name__ == "__main__":
         ],
     )
 
-    with set_mesh(cfg.mesh):
+    with jax.sharding.set_mesh(cfg.mesh):
         zero_cache = l4jax.KVCache.init(random.key(1), cfg, input.shape[0], cfg.max_seq_len)
         next_tokens, logits, cache = l4jax.prefill(input, weights, zero_cache, cfg)
-        curr_tokens = next_tokens.at[:, cache.length - 1 : cache.length].get(out_sharding=P(None, None))
+        curr_tokens = next_tokens.at[:, cache.iter - 1 : cache.iter].get(out_sharding=P(None, None))
         tokens_list = []
         for _ in range(32):
             tokens_list.append(curr_tokens)
@@ -78,4 +75,6 @@ if __name__ == "__main__":
         tokens = np.array(jnp.concatenate(tokens_list, axis=-1))
     responses = [tokenizer.decode(row) for row in tokens]
     print("Responses:")
-    print(responses)
+    for response in responses:
+        print(response)
+        print("\n".join(3 * ["-" * 80]))

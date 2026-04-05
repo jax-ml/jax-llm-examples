@@ -17,8 +17,6 @@ dependencies = [
     "numpy",
     "flatbuffers",
     "tensorstore",
-    #"orbax-checkpoint",
-    #"datasets",
     "gcsfs",
     "etils",
     "importlib_resources",

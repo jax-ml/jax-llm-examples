@@ -16,10 +16,8 @@ dependencies = [
     "numpy",
     "orbax-checkpoint",
     "ipykernel",
-    "tpu-info",
     "etils",
     "torch",
-    "torchvision>=0.21.0",
 ]
 
 # we don't need CUDA torch

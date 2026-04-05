@@ -18,12 +18,7 @@ from absl.testing import absltest, parameterized
 import jax
 from jax import numpy as jnp
 from jax import random
-from jax.sharding import PartitionSpec as P, AxisType, set_mesh
-try:
-    from jax.sharding import use_mesh as set_mesh
-except ImportError:
-    pass
-
+from jax.sharding import AxisType
 
 from gpt_oss_jax import model as gpt_jax
 
@@ -74,7 +69,7 @@ MOE_CFG = gpt_jax.Config(
 
 class TestModel(parameterized.TestCase):
     def setUp(self):
-        self.mesh = jax.make_mesh((1, len(jax.devices()), 1), P("x", "y", "z"), axis_types=(AxisType.Explicit,) * 3)
+        self.mesh = jax.make_mesh((1, len(jax.devices()), 1), ("x", "y", "z"), axis_types=(AxisType.Explicit,) * 3)
         self.small_moe_cfg = dataclasses.replace(MOE_CFG, mesh=self.mesh, num_layers=2, embed=32, vocab_size=128)
 
     @parameterized.product(quant=[False, True])
@@ -110,19 +105,29 @@ class TestModel(parameterized.TestCase):
         cache = gpt_jax.KVCache.init(random.key(0), cfg, 2, cfg.max_seq_len)
         del cache
 
-    @parameterized.product(moe=[True, False], quant_weights=[False, True], quant_cache=[True, False])
-    def test_prefill_decode(self, moe, quant_weights, quant_cache):
+    @parameterized.product(quant_weights=[False, True], quant_cache=[True, False])
+    def test_kernel_prefill(self, quant_weights, quant_cache):
         cfg = self.small_moe_cfg
-        cfg = dataclasses.replace(
-            cfg, quant_attn=quant_weights, quant_moe=quant_weights, quant_cache=quant_cache
-        )
+        cfg = dataclasses.replace(cfg, quant_attn=quant_weights, quant_moe=quant_weights, quant_cache=quant_cache)
+        cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=True)
         tokens = jnp.ones((1, 32), dtype=jnp.int32)
         weights = gpt_jax.Weights.init(random.key(0), cfg)
         cache = gpt_jax.KVCache.init(random.key(0), cfg, tokens.shape[0], cfg.max_seq_len)
-        with set_mesh(cfg.mesh):
+        with jax.sharding.set_mesh(cfg.mesh):
+            with self.assertRaisesRegex(NotImplementedError, r"Currently, only TPU supports prefill attention.*"):
+                _ = gpt_jax.prefill(tokens, weights, cache, cfg)
+
+    @parameterized.product(quant_weights=[False, True], quant_cache=[True, False])
+    def test_prefill_decode(self, quant_weights, quant_cache):
+        cfg = self.small_moe_cfg
+        cfg = dataclasses.replace(cfg, quant_attn=quant_weights, quant_moe=quant_weights, quant_cache=quant_cache)
+        tokens = jnp.ones((1, 32), dtype=jnp.int32)
+        weights = gpt_jax.Weights.init(random.key(0), cfg)
+        cache = gpt_jax.KVCache.init(random.key(0), cfg, tokens.shape[0], cfg.max_seq_len)
+        with jax.sharding.set_mesh(cfg.mesh):
             max_tokens, _, cache = gpt_jax.prefill(tokens, weights, cache, cfg)
         next_tokens = max_tokens[:, :-1]
-        with set_mesh(cfg.mesh):
+        with jax.sharding.set_mesh(cfg.mesh):
             for _ in range(2):
                 next_tokens, cache = gpt_jax.decode_step(next_tokens, weights, cache, cfg)
 

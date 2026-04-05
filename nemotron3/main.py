@@ -14,7 +14,6 @@
 
 import dataclasses
 from etils import epath
-import math
 import json
 
 import jax
@@ -33,6 +32,7 @@ def encode_input(tokenizer, texts, pad_id: int = n3jax.PAD_ID):
         tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True)
         for text in texts
     ]
+    inputs = [getattr(text, "input_ids", text) for text in inputs]
     max_len = max([len(x) for x in inputs])
     inputs = [(max_len - len(x)) * [pad_id] + x for x in inputs]
     return np.array(inputs)
@@ -52,7 +52,7 @@ if __name__ == "__main__":
     )
     cfg = n3jax.hf_to_jax_config(json.loads((ckpt_path / "config.json").read_text()))
     cfg = dataclasses.replace(cfg, mesh=mesh, quant_attn=quant, quant_moe=quant, quant_mlp=quant, quant_cache=quant, quant_mamba=quant)
-    cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=False, max_seq_len=2048, mamba_dtype=jnp.bfloat16)
+    cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=True, max_seq_len=2048, mamba_dtype=jnp.bfloat16)
 
     decode_step = jax.jit(n3jax.decode_step.lower, donate_argnames=("cache",), in_shardings=Format(Layout.AUTO))
     weights_formats, _= n3jax.optimal_formats(cfg)

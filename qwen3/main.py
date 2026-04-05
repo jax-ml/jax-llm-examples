@@ -20,10 +20,6 @@ import jax
 from jax import numpy as jnp
 from jax import random
 from jax.sharding import set_mesh, AxisType, PartitionSpec as P
-try:
-    from jax.sharding import use_mesh as set_mesh  # jax < 0.7.0
-except ImportError:
-    pass
 import numpy as np
 
 from qwen3_jax import model as q3jax
@@ -35,6 +31,7 @@ def encode_input(tokenizer, texts, pad_id: int = q3jax.PAD_ID):
         tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True)
         for text in texts
     ]
+    inputs = [getattr(text, "input_ids", text) for text in inputs]
     max_len = max([len(x) for x in inputs])
     inputs = [(max_len - len(x)) * [pad_id] + x for x in inputs]
     return np.array(inputs)
@@ -66,7 +63,7 @@ if __name__ == "__main__":
         ],
     )
 
-    with set_mesh(cfg.mesh):
+    with jax.sharding.set_mesh(cfg.mesh):
         zero_cache = q3jax.KVCache.init(random.key(1), cfg, input.shape[0], cfg.max_seq_len)
         next_tokens, logits, cache = q3jax.prefill(input, weights, zero_cache, cfg)
         curr_tokens = next_tokens.at[:, cache.iter - 1 : cache.iter].get(out_sharding=P(None, None))
