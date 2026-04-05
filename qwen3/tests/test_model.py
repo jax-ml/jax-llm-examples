@@ -104,6 +104,20 @@ class TestModel(parameterized.TestCase):
         del cache
 
     @parameterized.product(moe=[True, False], quant_weights=[False, True], quant_cache=[True, False])
+    def test_kernel_prefill(self, moe, quant_weights, quant_cache):
+        cfg = self.small_moe_cfg if moe else self.small_dense_cfg
+        cfg = dataclasses.replace(
+            cfg, quant_attn=quant_weights, quant_moe=quant_weights, quant_mlp=quant_weights, quant_cache=quant_cache
+        )
+        cfg = dataclasses.replace(cfg, use_prefill_attn_kernel=True)
+        tokens = jnp.ones((1, 32), dtype=jnp.int32)
+        weights = q3jax.Weights.init(random.key(0), cfg)
+        cache = q3jax.KVCache.init(random.key(0), cfg, tokens.shape[0], cfg.max_seq_len)
+        with set_mesh(cfg.mesh):
+            with self.assertRaisesRegex(NotImplementedError, r"Currently, only TPU supports prefill attention.*"):
+                _ = q3jax.prefill(tokens, weights, cache, cfg)
+
+    @parameterized.product(moe=[True, False], quant_weights=[False, True], quant_cache=[True, False])
     def test_prefill_decode(self, moe, quant_weights, quant_cache):
         cfg = self.small_moe_cfg if moe else self.small_dense_cfg
         cfg = dataclasses.replace(
