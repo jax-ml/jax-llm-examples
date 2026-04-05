@@ -21,10 +21,6 @@ import jax
 from jax import numpy as jnp
 from jax import random
 from jax.sharding import set_mesh, AxisType, PartitionSpec as P
-try:
-    from jax.sharding import use_mesh as set_mesh  # for jax < 0.7.0
-except ImportError:
-    pass
 import numpy as np
 
 from llama3_jax import model as l3jax
@@ -32,11 +28,12 @@ from llama3_jax import model as l3jax
 
 def encode_input(tokenizer, texts: list[str], model_name: str, pad_id: int = 0):
     assert isinstance(texts, list)
+    inputs = [tokenizer.apply_chat_template([{"role": "user", "content": text}]) for text in texts]
     inputs = [
-        tokenizer.apply_chat_template([{"role": "user", "content": text}])
+        getattr(input, "input_ids", input)
         + tokenizer.encode("<|start_header_id|>assistant<|end_header_id|>")
         + ([] if "deepseek" not in model_name.lower() else tokenizer.encode("<think>"))
-        for text in texts
+        for input in inputs
     ]
     max_len = max([len(x) for x in inputs])
     inputs = [(max_len - len(x)) * [pad_id] + x for x in inputs]
@@ -47,7 +44,7 @@ if __name__ == "__main__":
     #jax.distributed.initialize()  # if you want to run multi-host
     quant = True
 
-    ckpt_path = epath.Path("~/bucket/llama3_jax_old/DeepSeek-R1-Distill-Llama-3.1-8B-Instruct").expanduser()
+    ckpt_path = epath.Path("~/bucket/llama3_jax/DeepSeek-R1-Distill-Llama-3.1-8B-Instruct").expanduser()
     if quant:
         ckpt_path = ckpt_path.parent / f"{ckpt_path.name}-quant"
     tokenizer = l3jax.load_tokenizer(ckpt_path / "tokenizer.json", ckpt_path / "tokenizer_config.json")
@@ -70,7 +67,7 @@ if __name__ == "__main__":
         model_name=ckpt_path.name,
     )
 
-    with set_mesh(cfg.mesh):
+    with jax.sharding.set_mesh(cfg.mesh):
         zero_cache = l3jax.KVCache.init(random.key(1), cfg, input.shape[0])
         next_tokens, logits, cache = l3jax.prefill(input, weights, zero_cache, cfg)
         curr_tokens = next_tokens.at[:, cache.iter - 1 : cache.iter].get(out_sharding=P(None, None))
@@ -81,4 +78,6 @@ if __name__ == "__main__":
         tokens = np.array(jnp.concatenate(tokens_list, axis=-1))
     responses = [tokenizer.decode(row) for row in tokens]
     print("Responses:")
-    pprint(responses)
+    for response in responses:
+        print(response)
+        print("\n".join(3 * ["-" * 80]))

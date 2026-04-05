@@ -1348,12 +1348,15 @@ def optimal_formats(cfg: Config):
     weights_shardings, cache_shardings = Weights.shardings(cfg), KVCache.shardings(cfg, bs, cfg.max_seq_len)
     weights_shapes = tree_map(lambda x, s: SDS(x.shape, x.dtype, sharding=s), weights_abstract, weights_shardings)
     cache_shapes = tree_map(lambda x, s: SDS(x.shape, x.dtype, sharding=s), cache_abstract, cache_shardings)
-    _forward = lambda weights, cache: forward(*([jnp.ones((bs, 1), jnp.int32)] * 2), weights, cfg, cache=cache)
     with jax.sharding.set_mesh(cfg.mesh):
+        dummy_x = jax.ShapeDtypeStruct((bs, 1), jnp.int32, sharding=P(BATCH_AXIS_NAME, None))
+        dummy_segment_ids = jax.ShapeDtypeStruct((bs, 1), jnp.int32, sharding=P(BATCH_AXIS_NAME, None))
         fn = jax.jit(
-            _forward, in_shardings=Format(Layout.AUTO), out_shardings=Format(Layout.AUTO), donate_argnames=("cache",)
+            forward, in_shardings=Format(Layout.AUTO), out_shardings=Format(Layout.AUTO), donate_argnames=("cache",)
         )
-        weights_formats, cache_formats = fn.trace(weights_shapes, cache_shapes).lower().compile().input_formats[0]
+        fn_trace = fn.trace(dummy_x, dummy_segment_ids, weights_shapes, cfg=cfg, cache=cache_shapes)
+        args_formats, kw_formats = fn_trace.lower().compile().input_formats
+        (_, _, weights_formats), cache_formats = args_formats, kw_formats["cache"]
     weights = tree_map(lambda x, f: SDS(x.shape, x.dtype, sharding=f), weights_abstract, weights_formats)
     cache = tree_map(lambda x, f: SDS(x.shape, x.dtype, sharding=f), cache_abstract, cache_formats)
     return weights, cache

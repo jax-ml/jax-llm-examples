@@ -43,8 +43,5 @@ jobs:
           source venv/bin/activate
           pip install -U uv pip
           cd ${{ matrix.model }}
-          which uv
-          which python3
-          which python
-          uv pip install -e . pytest
+          uv pip install -e . pytest absl-py
           python3 -m pytest tests/test_model.py
