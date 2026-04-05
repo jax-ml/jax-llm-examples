@@ -82,6 +82,18 @@ class TestModel(parameterized.TestCase):
         del cache
 
     @parameterized.product(quant_weights=[False, True], quant_cache=[True, False])
+    def test_kernel_prefill(self, quant_weights, quant_cache):
+        cfg = dataclasses.replace(
+            self.small_cfg, quantize_attn=quant_weights, quantize_moe=quant_weights, quantize_cache=quant_cache,
+            use_prefill_attn_kernel=True,
+        )
+        tokens = jnp.ones((1, 32), dtype=jnp.int32)
+        weights = k2jax.Weights.init(random.key(0), cfg)
+        cache = k2jax.KVCache.init(random.key(0), cfg, tokens.shape[0], cfg.max_seq_len)
+        with self.assertRaises(NotImplementedError):
+            _ = k2jax.prefill(tokens, weights, cache, cfg)
+
+    @parameterized.product(quant_weights=[False, True], quant_cache=[True, False])
     def test_prefill_decode(self, quant_weights, quant_cache):
         cfg = dataclasses.replace(
             self.small_cfg, quantize_attn=quant_weights, quantize_moe=quant_weights, quantize_cache=quant_cache
