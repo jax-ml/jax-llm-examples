@@ -129,7 +129,7 @@ class Config:
     moe_num_experts: int
     moe_gate_up_alpha: float = 1.702
     moe_gate_up_limit: float = 7.0
-    moe_gate_dtype: jnp.dtype = jnp.float32
+    moe_gate_dtype: jax.typing.ArrayLike  = jnp.float32
     ep_strategy: str = "decode"
     # kernel config
     use_prefill_attn_kernel: bool = False
@@ -138,7 +138,7 @@ class Config:
     decode_ragged_dot_tiling: dict[str, int] = dataclasses.field(
         default_factory=lambda: {"block_g": 1, "block_n": 2**30, "block_compute": 32, "block_out": 2048}
     )
-    dtype: "jnp.dtype" = jnp.bfloat16
+    dtype: jax.typing.ArrayLike = jnp.bfloat16
     norm_eps: float = 1e-5
     # sharding
     rules: ShardingRules = dataclasses.field(default_factory=ShardingRules)
@@ -152,7 +152,7 @@ class Config:
     quant_moe: bool = False
     quant_attn: bool = False  # OpenAI doesn't seem to use this, i.e., always False
     quant_cache: bool = True
-    quant_scale_dtype: jnp.dtype = jnp.bfloat16
+    quant_scale_dtype: jax.typing.ArrayLike = jnp.bfloat16
     # sampling
     sample_topk: int = 4
     sample_temp: float = 0.7
