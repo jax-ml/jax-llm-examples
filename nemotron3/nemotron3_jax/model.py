@@ -1510,7 +1510,8 @@ def prepare_chunk(chunk, pad_to: int, pad_id: int):
 
 
 def prefill(
-    tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, pad_id: int = PAD_ID
+    tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, pad_id: int = PAD_ID,
+    lora=None, lora_scaling: float = 1.0,
 ) -> tuple[jax.Array, jax.Array, KVCache]:
     """Samples from a prompt."""
     # Calculate the next power of 2 for padding, up to cfg.max_seq.
@@ -1529,16 +1530,17 @@ def prefill(
         cache_shardings = tuple([z[idx] for idx in range(cfg.num_layers)] for z in cache_shardings)
     logits_shardings = jax.sharding.NamedSharding(cfg.mesh, P(BATCH_AXIS_NAME, None, TENSOR_AXIS_NAME))
     logits, cache = jax.jit(forward, donate_argnums=(4,), out_shardings=(logits_shardings, cache_shardings))(
-        prompt, prompt_segment_ids, weights, cfg, cache
+        prompt, prompt_segment_ids, weights, cfg, cache, lora, lora_scaling
     )
     next_tokens = jax.jit(partial(jnp.argmax, axis=-1))(logits)
     return next_tokens, logits, cache
 
 
 @partial(jax.jit, donate_argnames=("cache",))
-def decode_step(last_tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config):
+def decode_step(last_tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config,
+                lora=None, lora_scaling: float = 1.0):
     assert last_tokens.ndim == 2
     segment_ids = jnp.ones(last_tokens.shape, dtype=jnp.int32)
-    next_logits, cache = forward(last_tokens, segment_ids, weights, cfg, cache)
+    next_logits, cache = forward(last_tokens, segment_ids, weights, cfg, cache, lora, lora_scaling)
     next_tokens = jnp.argmax(next_logits, -1)
     return next_tokens, cache
