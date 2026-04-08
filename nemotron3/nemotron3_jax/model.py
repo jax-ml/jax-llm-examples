@@ -838,6 +838,8 @@ def attention_block(
     cache: KVCache | None = None,
     idx: int,
     cfg: Config,
+    lora=None,
+    lora_scaling: float = 1.0,
 ):
     l2p = lambda *specs: logical_to_physical(specs, cfg.rules)
     x = x.astype(cfg.dtype)
@@ -847,6 +849,25 @@ def attention_block(
         q = einsum("btd,dhgq->bhgtq", x, layer.q).astype(cfg.dtype)
         k = einsum("btd,dhq->bhtq", x, layer.k).astype(cfg.dtype)
         v = einsum("btd,dhq->bhtq", x, layer.v).astype(cfg.dtype)
+        if lora is not None:
+            from nemotron3_jax.lora import apply_lora_dense as _apply
+            b, t = x.shape[0], x.shape[1]
+            kv_heads, q_per_kv, head_dim = layer.q.shape[1], layer.q.shape[2], layer.q.shape[3]
+            if lora.q is not None:
+                d_q = _apply(x, lora.q, lora_scaling, cfg.dtype)
+                d_q = d_q.reshape((b, t, kv_heads, q_per_kv, head_dim)).transpose((0, 2, 3, 1, 4))
+                d_q = reshard(d_q, jax.typeof(q).sharding.spec)
+                q = q + d_q
+            if lora.k is not None:
+                d_k = _apply(x, lora.k, lora_scaling, cfg.dtype)
+                d_k = d_k.reshape((b, t, kv_heads, head_dim)).transpose((0, 2, 1, 3))
+                d_k = reshard(d_k, jax.typeof(k).sharding.spec)
+                k = k + d_k
+            if lora.v is not None:
+                d_v = _apply(x, lora.v, lora_scaling, cfg.dtype)
+                d_v = d_v.reshape((b, t, kv_heads, head_dim)).transpose((0, 2, 1, 3))
+                d_v = reshard(d_v, jax.typeof(v).sharding.spec)
+                v = v + d_v
 
     with jax.named_scope("cache_update"):
         if is_type(cache, KVCache):
@@ -877,9 +898,25 @@ def attention_block(
 
     # Project attention output
     with jax.named_scope("projection"):
+        attn_pre_o = attn_out  # (b, kv_heads, q_per_kv, t, head_dim)
         attn_out = einsum(
             "bhgtq,hgqd->btd", attn_out, layer.o, out_sharding=l2p("batch", "sequence", "act_embed")
         ).astype(cfg.dtype)
+        if lora is not None and lora.o is not None:
+            kv_heads, q_per_kv, head_dim = layer.q.shape[1], layer.q.shape[2], layer.q.shape[3]
+            r = lora.o.a.shape[-1]
+            # lora.o.a is replicated (q_heads*head_dim, r); reshape to (kv_heads, q_per_kv, head_dim, r)
+            o_a = jnp.reshape(lora.o.a.astype(attn_pre_o.dtype), (kv_heads, q_per_kv, head_dim, r))
+            # Contract over the (sharded) heads dims directly; JAX inserts the psum.
+            z = jnp.einsum(
+                "bhgtd,hgdr->btr", attn_pre_o, o_a,
+                out_sharding=l2p("batch", "sequence", None),
+            )
+            d_o = jnp.einsum(
+                "btr,re->bte", z, lora.o.b.astype(attn_pre_o.dtype),
+                out_sharding=l2p("batch", "sequence", "act_embed"),
+            ) * lora_scaling
+            attn_out = attn_out + d_o.astype(cfg.dtype)
     return attn_out, cache_updates
 
 
@@ -895,7 +932,10 @@ def _segment_sum(x: jax.Array):
     return jnp.where(iota[:, None] >= iota[None, :], z, -float("inf"))
 
 
-def mamba_block(x: jax.Array, segment_ids: jax.Array, layer: MambaLayer, cache: KVCache, idx: int, cfg: Config):
+def mamba_block(
+    x: jax.Array, segment_ids: jax.Array, layer: MambaLayer, cache: KVCache, idx: int, cfg: Config,
+    lora=None, lora_scaling: float = 1.0,
+):
     # adapted from https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/main/modeling_nemotron_h.py
     # with explicit sharding
     l2p = lambda *args: logical_to_physical(args, cfg.rules)
@@ -932,6 +972,40 @@ def mamba_block(x: jax.Array, segment_ids: jax.Array, layer: MambaLayer, cache: 
         dt = einsum("bte,eh->bth", x, layer.wdt_in).astype(cfg.mamba_dtype)
         B = einsum("bte,egs->btgs", x, layer.wb_in).astype(cfg.mamba_dtype)
         C = einsum("bte,egs->btgs", x, layer.wc_in).astype(cfg.mamba_dtype)
+        if lora is not None and lora.in_proj is not None:
+            from nemotron3_jax.lora import apply_lora_dense as _apply
+            x_size = cfg.mamba_num_heads * cfg.mamba_head_dim
+            bc_size = cfg.mamba_n_groups * cfg.mamba_ssm_state_size
+            dt_size = cfg.mamba_num_heads
+            fused = _apply(x, lora.in_proj, lora_scaling, cfg.mamba_dtype)
+            wg_d, wx_d, wb_d, wc_d, wdt_d = jnp.split(
+                fused,
+                [x_size, 2 * x_size, 2 * x_size + bc_size, 2 * x_size + 2 * bc_size],
+                axis=-1,
+            )
+            bsz, t = x.shape[0], x.shape[1]
+            wg_d = reshard(
+                wg_d.reshape((bsz, t, cfg.mamba_num_heads, cfg.mamba_head_dim)),
+                jax.typeof(gate).sharding.spec,
+            )
+            wx_d = reshard(
+                wx_d.reshape((bsz, t, cfg.mamba_num_heads, cfg.mamba_head_dim)),
+                jax.typeof(hidden_states).sharding.spec,
+            )
+            wb_d = reshard(
+                wb_d.reshape((bsz, t, cfg.mamba_n_groups, cfg.mamba_ssm_state_size)),
+                jax.typeof(B).sharding.spec,
+            )
+            wc_d = reshard(
+                wc_d.reshape((bsz, t, cfg.mamba_n_groups, cfg.mamba_ssm_state_size)),
+                jax.typeof(C).sharding.spec,
+            )
+            wdt_d = reshard(wdt_d, jax.typeof(dt).sharding.spec)
+            gate = gate + wg_d
+            hidden_states = hidden_states + wx_d
+            B = B + wb_d
+            C = C + wc_d
+            dt = dt + wdt_d
 
     kernel_size = cfg.mamba_conv_kernel_size
 
@@ -1077,9 +1151,25 @@ def mamba_block(x: jax.Array, segment_ids: jax.Array, layer: MambaLayer, cache: 
         )
         out = rms_norm(rms_norm_in, layer.gamma.reshape(norm_shape[-2:]), cfg.norm_eps)
         out = out.reshape(y.shape, out_sharding=l2p("batch", "sequence", "mamba_num_heads", "mamba_head_dim"))
+        pre_out = out  # (b, t, num_heads, head_dim)
         out = jnp.einsum(
             "bthd,hde->bte", out, layer.w_out, out_sharding=l2p("batch", "sequence", "act_embed")
         ).astype(cfg.dtype)
+        if lora is not None and lora.out_proj is not None:
+            r = lora.out_proj.a.shape[-1]
+            o_a = jnp.reshape(
+                lora.out_proj.a.astype(pre_out.dtype),
+                (cfg.mamba_num_heads, cfg.mamba_head_dim, r),
+            )
+            z = jnp.einsum(
+                "bthd,hdr->btr", pre_out, o_a,
+                out_sharding=l2p("batch", "sequence", None),
+            )
+            d_o = jnp.einsum(
+                "btr,re->bte", z, lora.out_proj.b.astype(pre_out.dtype),
+                out_sharding=l2p("batch", "sequence", "act_embed"),
+            ) * lora_scaling
+            out = out + d_o.astype(cfg.dtype)
 
     if ssm_state.dtype != cfg.mamba_dtype:
         raise ValueError(f"ssm_state={jax.typeof(ssm_state )} doesn't have {cfg.mamba_dtype}, something went wrong.")
@@ -1139,7 +1229,7 @@ def _moe_gmm(lhs, rhs, group_sizes, topk_idx, cfg: Config):
     return ret.astype(cfg.dtype)
 
 
-def moe_block(x: jax.Array, layer: MoELayer, cfg: Config):
+def moe_block(x: jax.Array, layer: MoELayer, cfg: Config, lora=None, lora_scaling: float = 1.0):
     assert x.ndim == 3
     l2p = lambda *axes: logical_to_physical(axes, cfg.rules)
     _psc = lambda z, spec: reshard(z, P(*spec))
@@ -1274,20 +1364,34 @@ def moe_block(x: jax.Array, layer: MoELayer, cfg: Config):
         ff_out_expert = psc(ff_out_expert, l2p("batch", "sequence", "act_embed"))
     with jax.named_scope("moe_shared_expert"):
         x_ = psc(x, x_spec)
-        ff_out_shared = mlp_block(x_, layer.ws_up, layer.ws_down, cfg=cfg)[..., :x.shape[-1]]
+        lora_up = lora.ws_up if lora is not None else None
+        lora_down = lora.ws_down if lora is not None else None
+        ff_out_shared = mlp_block(
+            x_, layer.ws_up, layer.ws_down, cfg=cfg,
+            lora_up=lora_up, lora_down=lora_down, lora_scaling=lora_scaling,
+        )[..., :x.shape[-1]]
         ff_out_shared = psc(ff_out_shared, l2p("batch", "sequence", "act_embed"))
     return ff_out_expert + ff_out_shared
 
 
-def mlp_block(x: jax.Array, w_up: jax.Array, w_down: jax.Array, *, cfg: Config):
+def mlp_block(
+    x: jax.Array, w_up: jax.Array, w_down: jax.Array, *, cfg: Config,
+    lora_up=None, lora_down=None, lora_scaling: float = 1.0,
+):
     l2p = lambda *specs: logical_to_physical(specs, cfg.rules)
     dtype = cfg.dtype
     with jax.named_scope("up_proj"):
         ff_up = einsum("btd,df->btf", x, w_up).astype(dtype)
+        if lora_up is not None:
+            from nemotron3_jax.lora import apply_lora_dense as _apply
+            ff_up = ff_up + _apply(x, lora_up, lora_scaling, dtype)
         ff_up = jax.nn.relu(ff_up) ** 2
     with jax.named_scope("down_proj"):
         ff_out = einsum("btf,fd->btd", ff_up, w_down, out_sharding=l2p("batch", "sequence", "act_embed"))
         ff_out = ff_out.astype(dtype)
+        if lora_down is not None:
+            from nemotron3_jax.lora import apply_lora_dense as _apply
+            ff_out = ff_out + _apply(ff_up, lora_down, lora_scaling, dtype)
     return ff_out
 
 
@@ -1298,6 +1402,8 @@ def forward_layer(
     idx: int,
     cfg: Config,
     cache: KVCache | None = None,
+    layer_lora=None,
+    lora_scaling: float = 1.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     x = x.astype(cfg.dtype)
 
@@ -1306,11 +1412,20 @@ def forward_layer(
         layer_in = rms_norm(x, layer.gamma, cfg.norm_eps)
     with jax.named_scope(f"ffn-{cfg.layer_pattern[idx]}"):
         if cfg.layer_pattern[idx] == "M":
-            out, cache_updates = mamba_block(layer_in, segment_ids, layer.ffw, cache=cache, idx=idx, cfg=cfg)
+            mamba_lora = layer_lora.mamba if layer_lora is not None else None
+            out, cache_updates = mamba_block(
+                layer_in, segment_ids, layer.ffw, cache=cache, idx=idx, cfg=cfg,
+                lora=mamba_lora, lora_scaling=lora_scaling,
+            )
         elif cfg.layer_pattern[idx] == "E":
-            out, cache_updates = moe_block(layer_in, layer.ffw, cfg=cfg), None
+            moe_lora = layer_lora.moe_shared if layer_lora is not None else None
+            out, cache_updates = moe_block(layer_in, layer.ffw, cfg=cfg, lora=moe_lora, lora_scaling=lora_scaling), None
         elif cfg.layer_pattern[idx] == "*":
-            out, cache_updates = attention_block(layer_in, segment_ids, layer.ffw, cache=cache, idx=idx, cfg=cfg)
+            attn_lora = layer_lora.attn if layer_lora is not None else None
+            out, cache_updates = attention_block(
+                layer_in, segment_ids, layer.ffw, cache=cache, idx=idx, cfg=cfg,
+                lora=attn_lora, lora_scaling=lora_scaling,
+            )
         else:
             raise NotImplementedError
     with jax.named_scope("residual"):
@@ -1318,7 +1433,10 @@ def forward_layer(
     return x, cache_updates
 
 
-def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None):
+def forward(
+    x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
+    cache: KVCache | None = None, lora=None, lora_scaling: float = 1.0,
+):
     l2p = lambda *args: logical_to_physical(args, cfg.rules)
     x = weights.embedding.at[x, :].get(out_sharding=l2p("batch", "sequence", "act_embed"))  # Embed input tokens [B, T] -> [B, T D]
 
@@ -1328,7 +1446,11 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
 
     all_cache_updates = []
     for idx, layer in enumerate(weights.layers):
-        x, cache_updates = forward_layer(x, segment_ids, layer, idx, cfg, cache)
+        layer_lora = lora.layers[idx] if lora is not None else None
+        x, cache_updates = forward_layer(
+            x, segment_ids, layer, idx, cfg, cache,
+            layer_lora=layer_lora, lora_scaling=lora_scaling,
+        )
         all_cache_updates.append(cache_updates)
 
     x = rms_norm(x, weights.gamma_final, cfg.norm_eps)  # Final layer norm.
