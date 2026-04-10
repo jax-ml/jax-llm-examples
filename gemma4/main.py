@@ -78,7 +78,7 @@ if __name__ == "__main__":
     input = encode_input(
         tokenizer,
         [
-            "Tell me your name. Be very consise.",
+            "Tell me your name. Be very concise.",
             "What is the weather like expressed in long prose in Old English",
             "Do you like ice cream, be extremely precise",
         ],

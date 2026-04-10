@@ -12,6 +12,7 @@ Current contents include:
 * [Kimi K2](kimi_k2/)
 * [OpenAI GPT OSS](gpt_oss/)
 * [NVIDIA Nemotron 3 Nano](nemotron3/)
+* [Gemma 4](gemma4/)
 
 ---
 
