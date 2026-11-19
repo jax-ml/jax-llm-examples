@@ -30,7 +30,10 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ke
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
 from jax.sharding import PartitionSpec as P, auto_axes, reshard
 from jax.experimental.array_serialization import pytree_serialization as ser
-from jax.experimental.pallas.ops.gpu import paged_attention
+try:
+    from jax.experimental.pallas.ops.gpu import paged_attention
+except ImportError:
+    paged_attention = None
 from etils import epath
 
 from . import ragged_attention
@@ -799,6 +802,8 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, q_offset, starts, l
 def paged_attention_kernel(q, k, v, block_tables, lengths, cfg: Config):
     if which_platform(cfg) not in ("gpu", "cuda"):
         raise ValueError("Paged attention is only supported on GPU.")
+    if paged_attention is None:
+        raise NotImplementedError("jax.experimental.pallas.ops.gpu.paged_attention is not available in this JAX version.")
     k, k_scale = (k.quant, k.scale) if is_type(k, QuantArray) else (k, None)
     v, v_scale = (v.quant, v.scale) if is_type(v, QuantArray) else (v, None)
 
