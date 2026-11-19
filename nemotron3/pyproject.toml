@@ -29,5 +29,8 @@ url = "https://download.pytorch.org/whl/cpu"
 requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+packages = ["nemotron3_jax"]
+
 [tool.setuptools.dynamic]
 dependencies = { file = ["pyproject.toml"] }
